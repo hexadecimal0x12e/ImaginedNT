@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>ImaginedNT.Core</RootNamespace>
+    <AssemblyName>ImaginedNT.Core</AssemblyName>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Iced" Version="1.21.0" />
+    <ProjectReference Include="..\ImaginedNT.Abstractions\ImaginedNT.Abstractions.csproj" />
+    <ProjectReference Include="..\ImaginedNT.Backends.Windows\ImaginedNT.Backends.Windows.csproj" />
+  </ItemGroup>
+</Project>

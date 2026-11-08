@@ -1,0 +1,14 @@
+{
+  "profiles": {
+    "ImaginedNT.Host": {
+      "commandName": "Project",
+      "commandLineArgs": "run ..\\..\\..\\..\\..\\samples\\bin\\shell.exe --no-native-forward --sandbox C:\\Users\\azert\\AppData\\Local\\Packages\\ImaginedNT.App_f91nmrsqwpk6y\\LocalState\\sandbox",
+      "nativeDebugging": true
+    },
+    "ImaginedNT.Host (Verbose)": {
+      "commandName": "Project",
+      "commandLineArgs": "run ..\\..\\..\\..\\..\\samples\\bin\\shell.exe --no-native-forward --verbose --sandbox C:\\Users\\azert\\AppData\\Local\\Packages\\ImaginedNT.App_f91nmrsqwpk6y\\LocalState\\sandbox",
+      "nativeDebugging": true
+    }
+  }
+}

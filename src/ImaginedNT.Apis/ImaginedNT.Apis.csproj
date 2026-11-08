@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ImaginedNT.Apis.Package\ImaginedNT.Apis.Package.csproj" />
+    <ProjectReference Include="..\ImaginedNT.Apis.Crt\ImaginedNT.Apis.Crt.csproj" />
+    <ProjectReference Include="..\ImaginedNT.Apis.System\ImaginedNT.Apis.System.csproj" />
+    <ProjectReference Include="..\ImaginedNT.Apis.File\ImaginedNT.Apis.File.csproj" />
+    <ProjectReference Include="..\ImaginedNT.Apis.Memory\ImaginedNT.Apis.Memory.csproj" />
+    <ProjectReference Include="..\ImaginedNT.Apis.Process\ImaginedNT.Apis.Process.csproj" />
+    <ProjectReference Include="..\ImaginedNT.Apis.Registry\ImaginedNT.Apis.Registry.csproj" />
+    <ProjectReference Include="..\ImaginedNT.Apis.Synchronization\ImaginedNT.Apis.Synchronization.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,16 @@
+{
+  "profiles": {
+    "ImaginedNT.App": {
+      "commandName": "MsixPackage",
+      "nativeDebugging": true
+    },
+    "XBOX": {
+      "commandName": "MsixPackage",
+      "doNotLaunchApp": false,
+      "remoteDebugEnabled": true,
+      "authenticationMode": "Universal",
+      "remoteDebugMachine": "192.168.1.67",
+      "nativeDebugging": true
+    }
+  }
+}

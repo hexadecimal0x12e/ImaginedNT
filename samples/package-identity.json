@@ -1,0 +1,9 @@
+{
+  "Name": "Example.Application",
+  "Publisher": "CN=Example",
+  "Version": "1.0.0.0",
+  "Architecture": "x64",
+  "ResourceId": "",
+  "InstallPath": "C:\\Program Files\\WindowsApps\\Example.Application",
+  "ApplicationId": "App"
+}

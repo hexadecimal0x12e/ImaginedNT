@@ -1,0 +1,12 @@
+# build outputs
+bin/
+obj/
+sandbox/
+artifacts/
+*.user
+.vs/
+*.trace.jsonl
+*.instrumented
+
+# sample object files (the .exe fixtures are rebuilt by samples/build-samples.ps1)
+samples/bin/*.obj
