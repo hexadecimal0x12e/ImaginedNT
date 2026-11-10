@@ -73,8 +73,8 @@ public sealed class ImaginedProcess : IDisposable
         _startTime = StartTime;
 
         Trace = runtime.Trace;
-        Memory = new VirtualMemoryManager(Trace, id);
-        Heap = new GuestHeap(Trace, id);
+        Memory = new VirtualMemoryManager(Trace, id, runtime.Memory);
+        Heap = new GuestHeap(Trace, id, memory: runtime.Memory);
         _heaps.Add(Heap);
         ObjectManager = runtime.Objects;
         Handles = new HandleTable(Trace, id);
@@ -154,7 +154,7 @@ public sealed class ImaginedProcess : IDisposable
         GuestHeap? heap = null;
         try
         {
-            heap = new GuestHeap(Trace, Id, options, initialSize, maximumSize);
+            heap = new GuestHeap(Trace, Id, options, initialSize, maximumSize, Runtime.Memory);
             var handle = heap.GetHandle(threadId);
             lock (_heapGate)
             {
@@ -218,7 +218,7 @@ public sealed class ImaginedProcess : IDisposable
         lock (_moduleGate)
             lock (_threadGate)
             {
-                if (Image is not null && Image.BaseAddress == baseAddress) return Image;
+                if (Image is not null && (Image.BaseAddress == baseAddress || Image.ContainsAddress(baseAddress))) return Image;
                 return _modules.FirstOrDefault(m => m.BaseAddress == baseAddress || m.ContainsAddress(baseAddress));
             }
     }
@@ -330,7 +330,7 @@ public sealed class ImaginedProcess : IDisposable
             return HostFileSystem.FileExists(name) ? name : throw new FileNotFoundException($"redirected DLL not found: '{name}'", name);
         if (Runtime.FindImportedLibrary(name) is { } imported) return imported;
         var candidates = new List<string>();
-        try { candidates.Add(FileSystem.MapPath(name, CurrentDirectory)); }
+        try { _ = FileSystem.MapPath(name, CurrentDirectory, FileOperation.Execute); candidates.Add(FileSystem.MapPath(name, CurrentDirectory)); }
         catch (NtFileException) { }
         if (!Path.IsPathRooted(name))
         {
@@ -340,9 +340,9 @@ public sealed class ImaginedProcess : IDisposable
         if (includeSystem) candidates.Add(Path.Combine(Environment.SystemDirectory, Path.GetFileName(name)));
         foreach (var path in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            if (HostFileSystem.FileExists(path)) return Path.GetFullPath(path);
+            if (HostFileSystem.FileExists(path)) return FileSystem.MapImagePath(path);
             if (!path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) && HostFileSystem.FileExists(path + ".dll"))
-                return Path.GetFullPath(path + ".dll");
+                return FileSystem.MapImagePath(path + ".dll");
         }
         return null;
     }
@@ -532,6 +532,7 @@ public sealed class ImaginedProcess : IDisposable
         lock (_moduleGate)
         {
             if (Image is not null) throw new InvalidOperationException("this imagined process already has a main image");
+            path = FileSystem.MapImagePath(path);
             var image = PeImage.Load(path);
             if (image.IsDll) throw new BadImageFormatException($"{image.FileName}: a DLL cannot be used as a process image");
             Trace.Emit(TraceKind.Image, $"parsing {image}", Id);
@@ -733,12 +734,15 @@ public sealed class ImaginedProcess : IDisposable
 
     private void SignalExit(int exitCode)
     {
+        bool notify;
         lock (_exitGate)
         {
             ExitCode ??= exitCode;
+            notify = !_terminating;
             _terminating = true;
             Monitor.PulseAll(_exitGate);
         }
+        if (notify) Runtime.OnProcessExited(this);
     }
 
     internal void FailFast(uint code, ulong address, string source, uint status = NtStatus.StackBufferOverrun)
@@ -748,9 +752,8 @@ public sealed class ImaginedProcess : IDisposable
             if (_faultExitCode is not null) return;
             _faultExitCode = unchecked((int)status);
             ExitCode = _faultExitCode;
-            _terminating = true;
-            Monitor.PulseAll(_exitGate);
         }
+        SignalExit(unchecked((int)status));
         foreach (var thread in Threads) thread.RequestTermination(unchecked((int)status));
         Trace.Error($"guest fail-fast: code={code} status=0x{status:X8} at 0x{address:X16} ({source}); stopping virtual process",
             Id, Runtime.GetCurrentThread()?.Id ?? 0);
@@ -960,12 +963,7 @@ public sealed class ImaginedProcess : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        lock (_exitGate)
-        {
-            ExitCode ??= 0;
-            _terminating = true;
-            Monitor.PulseAll(_exitGate);
-        }
+        SignalExit(0);
 
         var currentNativeId = Native.NativeMethods.GetCurrentThreadId();
         foreach (var thread in Threads)
@@ -990,6 +988,10 @@ public sealed class ImaginedProcess : IDisposable
             Trace.Warn($"process {Id} still has running guest threads; retaining its resources", Id);
             return;
         }
+        // COM objects hold guest-visible interface blocks and host references; release them before
+        // the process address space and sandbox go away.
+        try { Runtime.Com.ReleaseProcess(Id); }
+        catch (Exception ex) { Trace.Warn($"process {Id} COM cleanup: {ex.Message}", Id); }
         if (Disposing is { } disposing)
         {
             Disposing = null;
@@ -1010,6 +1012,7 @@ public sealed class ImaginedProcess : IDisposable
             foreach (var heap in _heaps) heap.Dispose();
             _heaps.Clear();
         }
+        Runtime.Memory.FreeHostAllocations(Id);
         try { Memory.Dispose(); } catch { }
         try { _job?.Dispose(); } catch { }
         Trace.Emit(TraceKind.Process, $"process {Id} disposed", Id);

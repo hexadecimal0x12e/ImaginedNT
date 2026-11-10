@@ -23,6 +23,18 @@ public static class ApiHelpers
         return obj;
     }
 
+    public static ProcessInformation? GetProcessInformation(ApiCallContext ctx, ulong handle)
+    {
+        if (handle == CurrentProcessPseudoHandle) return new ProcessInformation(ctx.Process);
+        return GetObject(ctx, handle) switch
+        {
+            ProcessObject p when ReferenceEquals(p.Process.Runtime, ctx.Runtime) => new ProcessInformation(p.Process),
+            SystemProcessObject p when ReferenceEquals(p.Runtime, ctx.Runtime) =>
+                ctx.Runtime.GetProcessInformation(ProcessInformation.SystemProcessId),
+            _ => null
+        };
+    }
+
     public static ulong NtStatusOr(ApiCallContext ctx, uint status) => status;
 
     public static void WriteNtStatus(ApiCallContext ctx, ulong ioStatus, uint status, ulong information = 0)
@@ -43,7 +55,10 @@ public static class ApiHelpers
         NtStatus.AccessDenied => Win32Error.AccessDenied,
         NtStatus.InvalidHandle => Win32Error.InvalidHandle,
         NtStatus.InvalidParameter => Win32Error.InvalidParameter,
+        NtStatus.PipeBroken => Win32Error.BrokenPipe,
         NtStatus.NoMemory => Win32Error.NotEnoughMemory,
+        NtStatus.InvalidAddress => 487,
+        NtStatus.WorkingSetLimitExceeded => 1453,
         NtStatus.SharingViolation => Win32Error.SharingViolation,
         NtStatus.EndOfFile => Win32Error.HandleEof,
         NtStatus.FileIsADirectory => 267,

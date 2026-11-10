@@ -1,0 +1,51 @@
+<Page
+    x:Class="ImaginedNT.FullTrustApp.Pages.RegistryPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <ComboBox x:Name="RegistryRoot" SelectedIndex="1" SelectionChanged="OnRegistryRootChanged" Margin="0,0,0,8">
+            <ComboBoxItem Content="HKEY_CLASSES_ROOT" />
+            <ComboBoxItem Content="HKEY_CURRENT_USER" />
+            <ComboBoxItem Content="HKEY_LOCAL_MACHINE" />
+            <ComboBoxItem Content="HKEY_USERS" />
+            <ComboBoxItem Content="HKEY_CURRENT_CONFIG" />
+        </ComboBox>
+        <Grid Grid.Row="1" Margin="0,0,0,12" ColumnSpacing="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Button Content="上一级" Click="OnRegistryUpClicked" />
+            <TextBox x:Name="RegistryPathInput" Grid.Column="1" Text="HKEY_CURRENT_USER" FontFamily="Consolas" KeyDown="OnRegistryPathKeyDown" />
+            <Button Grid.Column="2" Content="转到" Click="OnRegistryGoClicked" />
+        </Grid>
+        <Grid Grid.Row="2" ColumnSpacing="16">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="2*" />
+            </Grid.ColumnDefinitions>
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <TextBlock Text="子项 · 双击打开" Margin="12,0,0,8" />
+                <ListView Grid.Row="1" x:Name="RegistryKeys" DoubleTapped="OnRegistryKeyOpened" />
+            </Grid>
+            <Grid Grid.Column="1">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <TextBlock x:Name="RegistryValueHeader" Text="值 · 名称 / 类型 / 数据" Margin="12,0,0,8" />
+                <ListView Grid.Row="1" x:Name="RegistryValues" FontFamily="Consolas" SelectionMode="None" />
+            </Grid>
+        </Grid>
+    </Grid>
+</Page>

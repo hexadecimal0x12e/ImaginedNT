@@ -29,7 +29,12 @@ public static class SystemApis
         var handle = ctx.Arg(0);
         if (handle == CurrentProcessPseudoHandle) return (ulong)ctx.Process.Id;
         var obj = GetObject(ctx, handle);
-        return obj is ProcessObject p ? (ulong)p.Process.Id : 0;
+        return obj switch
+        {
+            ProcessObject p => (ulong)p.Process.Id,
+            SystemProcessObject => ProcessInformation.SystemProcessId,
+            _ => 0
+        };
     }
 
     [VirtualApi("kernel32.dll", "GetThreadId", ApiCategory.Thread)]
@@ -44,9 +49,9 @@ public static class SystemApis
     [VirtualApi("kernel32.dll", "GetExitCodeProcess", ApiCategory.Process)]
     private static ulong GetExitCodeProcess(ApiCallContext ctx)
     {
-        var obj = GetObject(ctx, ctx.Arg(0));
-        if (obj is not ProcessObject p) return BoolResult(ctx, false, Win32Error.InvalidHandle);
-        if (ctx.Arg(1) != 0) ctx.Memory.Write(ctx.Arg(1), unchecked((uint)(p.Process.ExitCode ?? 259)));
+        var p = GetProcessInformation(ctx, ctx.Arg(0));
+        if (p is null) return BoolResult(ctx, false, Win32Error.InvalidHandle);
+        if (ctx.Arg(1) != 0) ctx.Memory.Write(ctx.Arg(1), unchecked((uint)(p.ExitCode ?? 259)));
         return 1;
     }
 
@@ -139,7 +144,9 @@ public static class SystemApis
             ctx.Process.RequestProcessExit(code, ctx);
             return 1;
         }
-        var obj = GetObject(ctx, handle);
+        var status = ctx.Handles.TryGet(handle, 1 /* PROCESS_TERMINATE */, out var obj);
+        if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
+        if (obj is SystemProcessObject) return BoolResult(ctx, false, Win32Error.AccessDenied);
         if (obj is ProcessObject p)
         {
             if (ReferenceEquals(p.Process, ctx.Process))
@@ -153,7 +160,7 @@ public static class SystemApis
         return BoolResult(ctx, false, Win32Error.InvalidHandle);
     }
 
-    [VirtualApi("ntdll.dll", "NtTerminateProcess", ApiCategory.Process)]
+    [VirtualApi("ntdll.dll", "NtTerminateProcess", ApiCategory.Process, "ntdll!ZwTerminateProcess")]
     private static ulong NtTerminateProcess(ApiCallContext ctx)
     {
         var handle = ctx.Arg(0);
@@ -164,7 +171,9 @@ public static class SystemApis
             ctx.Process.RequestProcessExit(code, ctx);
             return NtStatus.Success;
         }
-        var obj = GetObject(ctx, handle);
+        var status = ctx.Handles.TryGet(handle, 1 /* PROCESS_TERMINATE */, out var obj);
+        if (status != NtStatus.Success) return status;
+        if (obj is SystemProcessObject) return NtStatus.AccessDenied;
         if (obj is not ProcessObject process) return NtStatus.InvalidHandle;
         if (ReferenceEquals(process.Process, ctx.Process)) ctx.Process.RequestProcessExit(code, ctx);
         else process.Process.Terminate(code);
@@ -328,13 +337,13 @@ public static class SystemApis
 
     [VirtualApi("kernel32.dll", "GetVersionExW", ApiCategory.System,
         "api-ms-win-core-sysinfo-l1-1-0.dll!GetVersionExW", "kernelbase.dll!GetVersionExW")]
-    private static ulong GetVersionExW(ApiCallContext ctx) =>
-        WriteVersionInfo(ctx, ctx.Arg(1), ctx.Arg32(0), unicode: true);
+    private static ulong GetVersionExW(ApiCallContext ctx) => ctx.Arg(0) == 0 ? 0 :
+        WriteVersionInfo(ctx, ctx.Arg(0), ctx.Read<uint>(ctx.Arg(0)), unicode: true);
 
     [VirtualApi("kernel32.dll", "GetVersionExA", ApiCategory.System,
         "api-ms-win-core-sysinfo-l1-1-0.dll!GetVersionExA", "kernelbase.dll!GetVersionExA")]
-    private static ulong GetVersionExA(ApiCallContext ctx) =>
-        WriteVersionInfo(ctx, ctx.Arg(1), ctx.Arg32(0), unicode: false);
+    private static ulong GetVersionExA(ApiCallContext ctx) => ctx.Arg(0) == 0 ? 0 :
+        WriteVersionInfo(ctx, ctx.Arg(0), ctx.Read<uint>(ctx.Arg(0)), unicode: false);
 
     [VirtualApi("ntdll.dll", "RtlGetVersion", ApiCategory.System)]
     private static ulong RtlGetVersion(ApiCallContext ctx)
@@ -697,6 +706,18 @@ public static class SystemApis
         return handle;
     }
 
+    [VirtualApi("user32.dll", "LoadStringW", ApiCategory.Library,
+        "kernel32!LoadStringW", "api-ms-win-core-libraryloader-l1-2-0!LoadStringW")]
+    private static ulong LoadStringW(ApiCallContext ctx)
+    {
+        var mapped = ctx.Arg(0) == 0 ? ctx.Process.Image : ctx.Process.FindModule(ctx.Arg(0));
+        var module = mapped?.Image.Path is { } path ? LoadResourceModule(path) : (nint)(long)ctx.Arg(0);
+        return (uint)NativeLoadStringW(module, ctx.Arg32(1), (nint)(long)ctx.Arg(2), ctx.ArgInt32(3));
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "LoadStringW", SetLastError = true)]
+    private static extern int NativeLoadStringW(nint module, uint id, nint buffer, int capacity);
+
     private static int MarshalGetLastError() =>
         (int)System.Runtime.InteropServices.Marshal.GetLastWin32Error();
 
@@ -739,7 +760,8 @@ public static class SystemApis
         if (string.IsNullOrEmpty(name)) return 0;
         name = ctx.Runtime.ResolveLibraryName(name);
         if (ctx.Process.FindModuleByName(name) is { } existing) return existing.BaseAddress;
-        if (ctx.Runtime.Options.PreferHostSystemDlls && ImaginedRuntime.IsHostSystemModule(name))
+        if (ctx.Runtime.Options.PreferHostSystemDlls && ImaginedRuntime.IsHostSystemModule(name) &&
+            ApiRegistry.NormalizeModule(name) is not ("msvcrt" or "ucrtbase"))
         {
             var hostModule = ctx.Runtime.NativeApis.GetModuleHandle(name);
             if (hostModule != 0) return (ulong)(long)hostModule;
@@ -750,6 +772,13 @@ public static class SystemApis
             var managedPath = ResolveManagedLibraryPath(ctx, name);
             if (managedPath is not null)
             {
+                if (ctx.Runtime.Options.AllowNativeForwarding && ctx.Runtime.Options.ImportPolicy != ImportPolicy.ManagedOnly &&
+                    ctx.Runtime.ShouldLoadLibraryNatively(managedPath))
+                {
+                    var native = ctx.Runtime.NativeApis.LoadLibrary(managedPath);
+                    if (native == 0) ctx.SetLastError(126);
+                    return native;
+                }
                 var module = ctx.Process.LoadManagedLibrary(managedPath);
                 if (module is null)
                 {

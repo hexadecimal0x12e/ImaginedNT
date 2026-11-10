@@ -128,9 +128,15 @@ guest respects the API layer.
   managed loader), `DllMain`.
 - Section objects (`NtCreateSection`/`NtMapViewOfSection`), file mapping, async I/O, IO completion
   ports, APC delivery, alertable waits.
-- Native registry (`Nt*`), registry ACLs/notifications/transactions, COM, USER32/GDI,
-  networking, services, tokens/privileges, security descriptors. Common `Reg*` APIs use
-  `ImaginedRegistry` with JSON storage inside the sandbox.
+- Native registry (`Nt*`), registry ACLs/notifications/transactions, USER32/GDI, networking,
+  services, tokens/privileges, security descriptors. Common `Reg*` APIs use `ImaginedRegistry`
+  with JSON storage inside the sandbox.
+- DCOM/out-of-process COM activation, COM marshaling/proxies, `IDispatch`/type libraries, OLE
+  embedding, cross-apartment marshaling and `RoInitialize`/WinRT. The managed COM layer covers
+  in-process activation, class factories, guest vtables, BSTRs, partial host forwarding and
+  in-process server DLL loading; see the COM section of `README.md`. A partially imagined object
+  only exposes interfaces declared on its managed class, and its host object must expose the same
+  vtable layout (a CLR CCW host needs `[PreserveSig]`).
 - `NtCreateUserProcess`/`RtlCreateUserProcess`, token-based creation (`CreateProcessAsUserW`,
   `CreateProcessWithTokenW`, `CreateProcessWithLogonW`), and job objects as guest-visible handles.
   `CreateProcessW`/`A` and `WinExec` create managed children in the same host; real OS-process

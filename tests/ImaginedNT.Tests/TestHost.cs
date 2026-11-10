@@ -27,7 +27,7 @@ internal static class TestHost
 
     public static void RequireSamples()
     {
-        foreach (var sample in new[] { "hello.exe", "syscall.exe", "threads.exe", "fileio.exe", "memory.exe", "native.exe", "reloc.exe", "spin.exe", "dllhost.exe", "helper.dll", "directsyscall.exe", "spawn.exe", "child.exe", "shell.exe" })
+        foreach (var sample in new[] { "hello.exe", "syscall.exe", "threads.exe", "fileio.exe", "memory.exe", "native.exe", "reloc.exe", "spin.exe", "dllhost.exe", "helper.dll", "directsyscall.exe", "spawn.exe", "child.exe", "shell.exe", "comtest.exe", "comserver.dll" })
         {
             if (!File.Exists(Sample(sample)))
                 throw new SkipTestException($"sample {sample} is missing; run samples/build-samples.ps1");

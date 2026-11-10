@@ -51,6 +51,15 @@ public sealed class ApiRegistry
             normalized.StartsWith("ext-ms-win-kernelbase-registry-", StringComparison.Ordinal))
             yield return "advapi32";
 
+        // COM API sets are backed by ole32/combase; register implementations against ole32.
+        if (normalized.StartsWith("api-ms-win-core-com", StringComparison.Ordinal) ||
+            normalized.StartsWith("ext-ms-win-com-", StringComparison.Ordinal) ||
+            normalized == "combase")
+        {
+            yield return "ole32";
+            yield return "combase";
+        }
+
         // Many modern binaries import API sets instead of kernel32/ntdll.  The managed layer
         // registers against the classic names, so map the common API-set prefixes.
         if (normalized.StartsWith("api-ms-win-core-", StringComparison.Ordinal) ||

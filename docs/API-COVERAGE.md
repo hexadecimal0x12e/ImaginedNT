@@ -20,6 +20,9 @@ list.
 | `VirtualLock` / `VirtualUnlock` / `GetLargePageMinimum` | no-op / constant |
 | `RtlZeroMemory` / `RtlFillMemory` / `RtlCopyMemory` / `RtlMoveMemory` / `RtlCompareMemory` | chunked, bounds-safe |
 | `memcpy` | alias for `RtlCopyMemory` |
+| `GlobalMemoryStatus` / `GlobalMemoryStatusEx`, `GetPhysicallyInstalledSystemMemory` | isolated runtime capacity and availability; shared guest commit/reservation budgets |
+| `GetProcessMemoryInfo` / `K32GetProcessMemoryInfo`, `NtQueryInformationProcess` / `ZwQueryInformationProcess` | selected guest's allocation usage and peaks; `ProcessVmCounters` only for the NT query |
+| `GetPerformanceInfo` / `K32GetPerformanceInfo` | environment-wide memory accounting in pages and guest handle/process/thread counts |
 
 ## Files and I/O
 
@@ -163,6 +166,78 @@ If no guest module path matches, `LoadLibraryW/A` forwards to the host loader an
 `HMODULE`; `GetProcAddress` works on that handle through the host. The guest image itself is
 also a managed module for export resolution. Managed DLLs do not receive TLS callbacks, loader
 notifications, or a real PEB; `DllMain` is invoked synchronously from the calling guest thread.
+
+## COM
+
+`ImaginedNT.Apis.Com` is included by `BuiltinApis`. COM API-set names
+(`api-ms-win-core-com-l1-*`, `ext-ms-win-com-*`) and `combase` resolve to the `ole32`
+registrations. Interfaces, classes and methods are discovered from `[VirtualComInterface]`,
+`[VirtualComMethod]`, `[VirtualComClass]` and `[PartiallyImaginedComClass]` attributes when an
+API assembly is registered.
+
+| API | Notes |
+|---|---|
+| `CoInitialize`, `CoInitializeEx`, `CoUninitialize`, `CoGetApartmentType` | per guest-thread apartment state; `S_FALSE` on re-init, `RPC_E_CHANGED_MODE` on a different model |
+| `CoInitializeSecurity`, `CoSetProxyBlanket`, `CoGetCallerTID` | no-op success |
+| `CoCreateInstance`, `CoCreateInstanceEx` | managed classes, guest factories, registered servers, then host fallback; `CoCreateInstanceEx` accepts local `MULTI_QI` arrays |
+| `CoGetClassObject` | managed/partial class factory, guest factory `QueryInterface`, server `DllGetClassObject`, or host fallback; supports `IID_IClassFactory` and `IID_IUnknown` |
+| `CoRegisterClassObject`, `CoRevokeClassObject` | guest `IClassFactory` pointers, held with `AddRef`/`Release` |
+| `CoTaskMemAlloc`, `CoTaskMemFree`, `CoTaskMemRealloc` | host COM task allocator |
+| `CoCreateGuid`, `StringFromCLSID`, `StringFromIID`, `CLSIDFromString`, `IIDFromString` | GUID conversion; returned strings are task-allocated |
+| `CoLoadLibrary`, `CoFreeLibrary`, `CoFreeUnusedLibraries` | guest or host in-process server DLLs; invokes `DllGetClassObject`/`DllCanUnloadNow` where present |
+| `CoGetCurrentProcess`, `CoGetCurrentLogicalThreadId` | virtual process/thread identity |
+| `SysAllocString`, `SysAllocStringLen`, `SysFreeString`, `SysStringLen`, `SysStringByteLen` | BSTRs; also registered by ordinal `#2`, `#4`, `#6`, `#7` |
+
+Fully managed classes are registered by CLSID and implement their interface methods as
+`ulong Method(ComCallContext)`. The runtime allocates one guest-readable interface block per
+interface and a vtable of managed thunks; `IUnknown` and reference counting are implemented by the
+runtime. `ComCallContext` exposes argument accessors, GUID/interface/BSTR marshaling and the
+process memory manager. `ComThreadingModel.Apartment` objects reject calls from other threads with
+`RPC_E_WRONG_THREAD`; `Free`, `Both` and `Neutral` are unrestricted.
+
+Partially imagined classes implement selected slots in C# and emit `this`-rewriting native
+trampolines for the remaining slots. The host object comes from the host CLSID via real
+`ole32!CoCreateInstance` or from `ComRuntime.RegisterHostClass(hostClsid, iid => pointer)`. A CLR
+CCW used as the host must mark its interface methods `[PreserveSig]` so the native vtable matches.
+Aggregation and interfaces not declared on the managed class return `CLASS_E_NOAGGREGATION` /
+`E_NOINTERFACE`.
+
+Not implemented: DCOM/out-of-process activation, proxies and marshaling, `IDispatch`/type
+libraries, OLE embedding/drag-and-drop, cross-apartment marshaling, class registration in the host
+registry, `CoGetMalloc`, `RoInitialize`/WinRT, and `COSERVERINFO` targets in `CoCreateInstanceEx`.
+Guest server DLLs remain mapped for the process lifetime even after `CoFreeLibrary`; host server
+DLLs are released when `DllCanUnloadNow` returns `S_OK`.
+
+## Window manager and DWM (`ImaginedNT.App`)
+
+These registrations live in the UWP App project (`src/ImaginedNT.App/Gui`), not in
+`ImaginedNT.Apis`: the window personality is an App-layer interface that needs a host compositor.
+`GuiSession` creates a runtime whose API set is `BuiltinApis.Assemblies` plus the App assembly,
+and attaches a `WindowManager` that `Controls/DwmCompositor.xaml` renders.
+
+| API | Notes |
+|---|---|
+| `RegisterClassExW/A`, `RegisterClassW/A`, `UnregisterClassW/A` | per-process class table and atoms; built-in `STATIC`/`BUTTON`/`EDIT`/`COMBOBOX`/`LISTBOX`/`SCROLLBAR` |
+| `CreateWindowExW/A`, `DestroyWindow` | child windows, parent/owner relationship, `WM_NCCREATE`/`WM_CREATE`/`WM_DESTROY`/`WM_NCDESTROY`, `CREATESTRUCTW` in guest memory |
+| `ShowWindow`, `ShowWindowAsync`, `UpdateWindow`, `MoveWindow`, `SetWindowPos` | App-composited geometry; `WM_SHOWWINDOW`/`WM_MOVE`/`WM_SIZE`/`WM_PAINT` |
+| `GetWindowRect`, `GetClientRect`, `ClientToScreen`, `ScreenToClient` | guest client area excludes the App-drawn caption/border; child coordinates convert from parent-client space |
+| `SetWindowTextW/A`, `GetWindowTextW/A`, `GetWindowTextLengthW/A`, `GetClassNameW/A` | titles and class names; `SetWindowTextW` routes `WM_SETTEXT` through the guest wndproc |
+| `SetWindowLongPtrW/A`, `GetWindowLongPtrW/A`, `SetWindowLongW`, `GetWindowLongW` | style, ex-style, wndproc, user data, instance, parent and control id |
+| `ShowWindow`, `EnableWindow`, `IsWindow`, `IsWindowVisible`, `IsWindowEnabled`, `FindWindowW/A` | state queries and search |
+| `Get/SetForegroundWindow`, `Get/SetActiveWindow`, `Get/SetFocus`, `GetDlgCtrlID`, `SetParent`, `BringWindowToTop` | App-side z-order and focus; focus changes post `WM_KILLFOCUS`/`WM_SETFOCUS` |
+| `GetMessageW/A`, `PeekMessageW/A`, `TranslateMessage`, `DispatchMessageW/A`, `PostMessageW/A`, `PostThreadMessageW/A`, `SendMessageW/A`, `PostQuitMessage`, `DefWindowProcW/A`, `CallWindowProcW/A` | per-guest-thread queues; `GetMessageW` blocks and wakes on process/thread termination; `WM_QUIT` ends the loop |
+| `GetMessagePos`, `GetMessageTime`, `WaitMessage`, `GetSystemMetrics` | virtual screen and message metadata |
+| `Get/SetCursorPos`, `LoadCursorW/A`, `LoadIconW/A`, `LoadImageW/A`, `Set/GetCursor` | opaque non-zero handles; the XAML compositor owns the visible cursor |
+| `GetKeyState`, `GetAsyncKeyState`, `GetKeyboardState` | state fed by the compositor's key path |
+| `SetTimer`, `KillTimer`, `InvalidateRect`, `ValidateRect`, `RedrawWindow` | timer `WM_TIMER` and paint invalidation |
+| `GetSysColor`, `GetSysColorBrush`, `MessageBeep` | dark simulated desktop palette so `COLOR_WINDOW+1` backgrounds are visible |
+| `dwmapi!DwmIsCompositionEnabled`, `DwmEnableComposition`, `DwmExtendFrameIntoClientArea`, `DwmSet/GetWindowAttribute`, `DwmFlush`, thumbnail stubs | composition is always reported enabled; extended-frame bounds map to the App window rect |
+
+The compositor forwards pointer press/move/release/wheel and keyboard key/character events using
+the same hit-testing and message paths.  There is intentionally no GDI: `BeginPaint`, `GetDC`,
+`FillRect`, `BitBlt` and friends are not implemented, so only the App-drawn chrome/background and
+child-control text are visible.  A guest that only creates windows and runs a message loop is
+fully usable; a GDI-rendered application is not yet a target.
 
 ## Runtime information (`imaginednt.dll`)
 

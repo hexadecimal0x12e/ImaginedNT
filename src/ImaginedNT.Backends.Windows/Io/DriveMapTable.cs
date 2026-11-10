@@ -1,0 +1,177 @@
+using System.Globalization;
+using System.Text.RegularExpressions;
+using YamlDotNet.RepresentationModel;
+
+namespace ImaginedNT.Core.Io;
+
+public enum FileOperation { Read, Write, Enum, Execute, Delete }
+public sealed record FileRule(bool Allowed, string? Target = null, bool Virtual = false, bool Discard = false);
+
+public sealed class DriveMapTable
+{
+    private sealed record RuleSet(Dictionary<FileOperation, FileRule> Permissions, bool? Excluded = null);
+    private sealed record Entry(string Pattern, RuleSet Rules, List<Entry> Children);
+    private readonly List<Entry> _entries;
+    private readonly RuleSet _defaults;
+    private readonly bool _inherit;
+    public VirtualDriveOptions Options { get; }
+    public bool Readonly { get; }
+
+    private DriveMapTable(YamlMappingNode root, string source)
+    {
+        var fields = root.Children.ToDictionary(p => Text(p.Key), p => p.Value, StringComparer.Ordinal);
+        foreach (var key in fields.Keys)
+            if (!new[] { "ImaginedNT VirtFS MapTable", "Label", "Serial", "MaximumSpace", "Readonly", "Inherit", "Default", "HostRoot", "Initials", "FS" }.Contains(key))
+                throw Error(root, $"unknown field {key}");
+        string Get(string key, string fallback) => fields.TryGetValue(key, out var n) ? Text(n) : fallback;
+        if (Get("ImaginedNT VirtFS MapTable", "") != "v1") throw Error(root, "expected MapTable v1");
+        var directory = Path.GetDirectoryName(Path.GetFullPath(source))!;
+        var capacity = ulong.Parse(Get("MaximumSpace", "137438953472"), CultureInfo.InvariantCulture);
+        Options = new(Path.GetFullPath(Get("HostRoot", "."), directory))
+        {
+            Label = Get("Label", "ImaginedNT"), TotalBytes = capacity, FreeBytes = capacity,
+            SerialNumber = uint.Parse(Get("Serial", "1234-5678").Replace("-", ""), NumberStyles.HexNumber, CultureInfo.InvariantCulture)
+        };
+        if (capacity / 4096 > uint.MaxValue) throw Error(root, "capacity exceeds supported volume size");
+        Readonly = bool.Parse(Get("Readonly", "false"));
+        _inherit = bool.Parse(Get("Inherit", "true"));
+        var templates = fields.TryGetValue("Initials", out var initials) ? Mapping(initials).Children.ToDictionary(p => Text(p.Key).TrimStart('-'), p => p.Value) : [];
+        RuleSet Parse(YamlNode node, HashSet<string>? stack = null)
+        {
+            stack ??= [];
+            var result = new Dictionary<FileOperation, FileRule>();
+            bool? excluded = null;
+            foreach (var raw in Regex.Split(Text(node), ",(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)"))
+            {
+                var token = raw.Trim();
+                if (token.Length == 0) continue;
+                var inverse = token.StartsWith("-<");
+                var template = token.TrimStart('+', '-');
+                if (template.StartsWith('<') && template.EndsWith('>'))
+                {
+                    var value = template == "<default>" ? fields.GetValueOrDefault("Default") : templates.GetValueOrDefault(template);
+                    if (value is null || !stack.Add(template)) throw Error(node, $"unknown or cyclic template {template}");
+                    var expanded = Parse(value, stack);
+                    foreach (var pair in expanded.Permissions) result[pair.Key] = inverse ? pair.Value with { Allowed = !pair.Value.Allowed, Target = null, Discard = false } : pair.Value;
+                    if (expanded.Excluded is bool hidden) excluded = inverse ? !hidden : hidden;
+                    stack.Remove(template);
+                    continue;
+                }
+                if (token is "exclude" or "+exclude" or "-exclude")
+                {
+                    excluded = token != "-exclude";
+                    continue;
+                }
+                var match = Regex.Match(token, "^([+-])(read|write|enum|execute|delete)(?::(discard|remap_host@\"([^\"]+)\"|remap_virt@\"([^\"]+)\"))?$", RegexOptions.CultureInvariant);
+                if (!match.Success) throw Error(node, $"invalid permission {token}");
+                var op = Enum.Parse<FileOperation>(match.Groups[2].Value, true);
+                var target = match.Groups[4].Success ? Path.GetFullPath(match.Groups[4].Value, directory) : match.Groups[5].Success ? match.Groups[5].Value : null;
+                if (match.Groups[3].Success && (match.Groups[1].Value != "+" || op is not (FileOperation.Read or FileOperation.Write))) throw Error(node, "remap requires +read or +write");
+                if (match.Groups[3].Value == "discard" && op != FileOperation.Write) throw Error(node, "discard requires +write");
+                result[op] = new(match.Groups[1].Value == "+", target, match.Groups[5].Success, match.Groups[3].Value == "discard");
+            }
+            return new(result, excluded);
+        }
+        _defaults = fields.TryGetValue("Default", out var defaults) ? Parse(defaults) : new([]);
+        foreach (var t in templates.Values) _ = Parse(t);
+        List<Entry> Entries(YamlNode node, int depth = 0)
+        {
+            if (depth > 64) throw Error(node, "rule tree too deep");
+            var entries = new List<Entry>();
+            foreach (var pair in Mapping(node).Children)
+            {
+                var name = Text(pair.Key);
+                if (!name.StartsWith('-')) throw Error(pair.Key, "rule names must start with '-'");
+                name = name[1..];
+                if (name.Length == 0 || name.Contains(':') || name.Split('\\').Any(p => p is ".." or ".") || (name.Contains('<') && name is not ("<self>" or "<left>"))) throw Error(pair.Key, "invalid rule path");
+                entries.Add(pair.Value is YamlMappingNode ? new(name, new([]), Entries(pair.Value, depth + 1)) : new(name, Parse(pair.Value), []));
+            }
+            return entries;
+        }
+        _entries = fields.TryGetValue("FS", out var fs) ? Entries(fs) : [];
+    }
+
+    public static DriveMapTable Load(string path)
+    {
+        try
+        {
+            var stream = new YamlStream();
+            using var reader = new StreamReader(HostFileSystem.OpenRead(path));
+            stream.Load(reader);
+            if (stream.Documents.Count != 1) throw new InvalidDataException("expected one YAML document");
+            return new(Mapping(stream.Documents[0].RootNode), path);
+        }
+        catch (Exception ex) when (ex is not IOException && ex is not UnauthorizedAccessException)
+        { throw new InvalidDataException($"{path}: {ex.Message}", ex); }
+    }
+    private static string Text(YamlNode node) => node is YamlScalarNode s ? s.Value ?? "" : throw Error(node, "expected scalar");
+    private static YamlMappingNode Mapping(YamlNode node) => node as YamlMappingNode ?? throw Error(node, "expected mapping");
+    private static InvalidDataException Error(YamlNode node, string message) => new($"line {node.Start.Line}, column {node.Start.Column}: {message}");
+    private static bool Matches(string pattern, string path) => Regex.IsMatch(path.Replace('\\', '/'),
+        "^" + Regex.Escape(pattern.Replace('\\', '/')).Replace(@"\*\*/", "(?:.*/)?").Replace(@"\*\*", ".*").Replace(@"\*", "[^/]*").Replace(@"\?", "[^/]") + "$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    public IEnumerable<string> Children(string relative)
+    {
+        IEnumerable<string> Walk(List<Entry> entries, string prefix)
+        {
+            foreach (var e in entries.Where(e => e.Pattern.IndexOfAny(['*', '?', '<']) < 0))
+            {
+                var path = prefix.Length == 0 ? e.Pattern : prefix + "\\" + e.Pattern;
+                yield return path;
+                foreach (var child in Walk(e.Children, path)) yield return child;
+            }
+        }
+        var prefix = relative.Length == 0 ? "" : relative + "\\";
+        return Walk(_entries, "").Where(p => p.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            .Select(p => p[prefix.Length..].Split('\\')[0]).Where(p => p.Length != 0).Distinct(StringComparer.OrdinalIgnoreCase)
+            .Where(p => !IsExcluded(prefix + p));
+    }
+
+    private bool IsExcluded(string relative)
+    {
+        _ = Resolve(relative, FileOperation.Enum, out var excluded);
+        return excluded;
+    }
+
+    public (FileRule Rule, string Suffix) Resolve(string relative, FileOperation operation) => Resolve(relative, operation, out _);
+
+    public (FileRule Rule, string Suffix) Resolve(string relative, FileOperation operation, out bool excluded)
+    {
+        var rules = new Dictionary<FileOperation, FileRule>(_defaults.Permissions);
+        var hidden = _defaults.Excluded ?? false;
+        var bases = new Dictionary<FileOperation, string>();
+        void Apply(RuleSet? values, string prefix)
+        {
+            if (values is null) return;
+            foreach (var p in values.Permissions) { rules[p.Key] = p.Value; bases[p.Key] = prefix; }
+            if (values.Excluded is bool value) hidden = value;
+        }
+        void Visit(List<Entry> entries, string remainder, string prefix)
+        {
+            Apply(entries.FirstOrDefault(e => e.Pattern == "<self>")?.Rules, prefix);
+            if (remainder.Length == 0) return;
+            if (!_inherit)
+            {
+                rules = new(_defaults.Permissions);
+                hidden = _defaults.Excluded ?? false;
+                bases.Clear();
+            }
+            var head = remainder.Split('\\')[0];
+            var matching = entries.Where(e => e.Pattern is not ("<self>" or "<left>") &&
+                (Matches(e.Pattern, remainder) || Matches(e.Pattern, head))).OrderBy(e => e.Pattern.IndexOfAny(['*', '?']) < 0 ? 1 : 0).ToList();
+            if (matching.Count == 0) matching = entries.Where(e => e.Pattern == "<left>").ToList();
+            foreach (var e in matching)
+            {
+                var consumed = e.Pattern.Contains('\\') ? remainder : head;
+                var next = prefix.Length == 0 ? consumed : prefix + "\\" + consumed;
+                Apply(e.Rules, next);
+                if (e.Children.Count != 0) Visit(e.Children, remainder.Length == consumed.Length ? "" : remainder[(consumed.Length + 1)..], next);
+            }
+        }
+        Visit(_entries, relative, "");
+        excluded = hidden;
+        var rule = rules.GetValueOrDefault(operation) ?? new(false);
+        var basis = bases.GetValueOrDefault(operation) ?? "";
+        return (rule, basis.Length == 0 ? relative : relative.Length > basis.Length ? relative[(basis.Length + 1)..] : "");
+    }
+}

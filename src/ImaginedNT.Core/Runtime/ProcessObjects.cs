@@ -45,3 +45,11 @@ public sealed class ProcessObject : NtObject
         return Process.WaitForExit(milliseconds) ? NtStatus.Wait0 : NtStatus.WaitTimeout;
     }
 }
+
+public sealed class SystemProcessObject(ImaginedRuntime runtime) : NtObject
+{
+    public ImaginedRuntime Runtime { get; } = runtime;
+    public override ObjectType ObjectType => ObjectType.Process;
+    public override string TypeName => "Process";
+    public override string Info => "pid=4 image=" + ProcessInformation.SystemImagePath;
+}

@@ -37,7 +37,7 @@ public static class NativeApiSignatures
             "CloseHandle" or "SetEvent" or "ResetEvent" or "PulseEvent" or "ReleaseMutex" or "FlushFileBuffers" or
                 "SetEndOfFile" or "GetFileType" => 1,
             "GetHandleInformation" or "WaitForSingleObject" or "GetFileSize" or "GetFileSizeEx" or
-                "GetExitCodeProcess" or "GetExitCodeThread" => 2,
+                "GetExitCodeProcess" or "GetExitCodeThread" or "TerminateProcess" => 2,
             "SetHandleInformation" or "WaitForSingleObjectEx" or "ReleaseSemaphore" => 3,
             "SetFilePointer" or "SetFilePointerEx" or "WaitForMultipleObjects" => 4,
             "ReadFile" or "WriteFile" or "WaitForMultipleObjectsEx" => 5,
@@ -121,6 +121,7 @@ public static class NativeApiSignatures
         Add("NtWriteVirtualMemory", 5, [0]);
         Add("NtFlushInstructionCache", 3, [0]);
         Add("NtOpenProcess", 4, outputs: [0], attrs: [2]);
+        Add("NtTerminateProcess", 2, [0]);
         Add("NtOpenThread", 4, outputs: [0], attrs: [2]);
         Add("NtCreateThreadEx", 11, [3], [0], [2]);
         Add("NtQueryInformationProcess", 5, [0]);

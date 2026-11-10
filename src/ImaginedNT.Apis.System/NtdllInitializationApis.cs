@@ -4,6 +4,18 @@ namespace ImaginedNT.Core.Runtime;
 
 public static class NtdllInitializationApis
 {
+    [VirtualApi("ntdll.dll", "RtlPcToFileHeader", ApiCategory.Library)]
+    private static unsafe ulong RtlPcToFileHeader(ApiCallContext ctx)
+    {
+        if (ctx.Process.FindModule(ctx.Arg(0)) is { } module)
+        {
+            if (ctx.Arg(1) != 0) ctx.Write(ctx.Arg(1), module.BaseAddress);
+            return module.BaseAddress;
+        }
+        var address = ctx.Runtime.NativeApis.Resolve("ntdll.dll", "RtlPcToFileHeader", null, out _);
+        return address == 0 ? 0 : ((delegate* unmanaged<ulong, ulong, ulong>)(nint)address)(ctx.Arg(0), ctx.Arg(1));
+    }
+
     [PartiallyImaginedApi("ntdll.dll", "RtlEncodePointer", ApiCategory.Memory)]
     private static ulong RtlEncodePointer(ApiCallContext ctx) => HostEncodePointer(ctx.Arg(0));
 

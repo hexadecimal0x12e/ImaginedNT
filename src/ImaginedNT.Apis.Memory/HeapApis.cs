@@ -29,15 +29,19 @@ public static class HeapApis
     {
         if (TryHeap(ctx, out var heap))
         {
-            if (!Flags(ctx, ctx.Arg32(1), 0x9)) return 0;
+            if (!Flags(ctx, ctx.Arg32(1), 0xD)) return 0;
             var address = heap!.Allocate(ctx.Arg(2), (ctx.Arg32(1) & 8) != 0, ctx.Thread.Id);
-            if (address == 0) ctx.SetLastError(Win32Error.NotEnoughMemory);
-            return address;
+            return address == 0 ? AllocationFailure(ctx) : address;
         }
         if (!IsHostHeap((nint)(long)ctx.Arg(0))) return 0;
-        var host = HostRtlAllocateHeap((nint)(long)ctx.Arg(0), ctx.Arg32(1), (nuint)ctx.Arg(2));
-        if (host == 0) ctx.SetLastError(Win32Error.NotEnoughMemory);
-        return (ulong)(long)host;
+        lock (ctx.Runtime.Memory.Gate)
+        {
+            if (!CheckHostAllocation(ctx, ctx.Arg(2))) return 0;
+            var host = HostRtlAllocateHeap((nint)(long)ctx.Arg(0), ctx.Arg32(1), (nuint)ctx.Arg(2));
+            if (host != 0) ctx.Runtime.Memory.TrackHostAllocation(ctx.Process.Id, ctx.Arg(0), 0, (ulong)host, ChargeSize(ctx.Arg(2)));
+            if (host == 0) ctx.SetLastError(Win32Error.NotEnoughMemory);
+            return (ulong)(long)host;
+        }
     }
 
     [VirtualApi("kernel32.dll", "HeapFree", ApiCategory.Memory, "kernelbase!HeapFree", "ntdll!RtlFreeHeap")]
@@ -49,8 +53,12 @@ public static class HeapApis
             return BoolResult(ctx, heap!.Free(ctx.Arg(2), ctx.Thread.Id), Win32Error.InvalidParameter);
         }
         if (!IsHostHeap((nint)(long)ctx.Arg(0))) return 0;
-        return BoolResult(ctx, HostRtlFreeHeap((nint)(long)ctx.Arg(0), ctx.Arg32(1),
-            (nint)(long)ctx.Arg(2)) != 0, Win32Error.InvalidParameter);
+        lock (ctx.Runtime.Memory.Gate)
+        {
+            var freed = HostRtlFreeHeap((nint)(long)ctx.Arg(0), ctx.Arg32(1), (nint)(long)ctx.Arg(2)) != 0;
+            if (freed) ctx.Runtime.Memory.ForgetHostAllocation(ctx.Arg(0), ctx.Arg(2));
+            return BoolResult(ctx, freed, Win32Error.InvalidParameter);
+        }
     }
 
     [VirtualApi("kernel32.dll", "HeapReAlloc", ApiCategory.Memory, "kernelbase!HeapReAlloc", "ntdll!RtlReAllocateHeap")]
@@ -58,17 +66,22 @@ public static class HeapApis
     {
         if (TryHeap(ctx, out var heap))
         {
-            if (!Flags(ctx, ctx.Arg32(1), 0x19)) return 0;
+            if (!Flags(ctx, ctx.Arg32(1), 0x1D)) return 0;
             var address = heap!.Reallocate(ctx.Arg(2), ctx.Arg(3), (ctx.Arg32(1) & 8) != 0,
                 (ctx.Arg32(1) & 0x10) != 0, ctx.Thread.Id);
-            if (address == 0) ctx.SetLastError(Win32Error.NotEnoughMemory);
-            return address;
+            return address == 0 ? AllocationFailure(ctx) : address;
         }
         if (!IsHostHeap((nint)(long)ctx.Arg(0))) return 0;
-        var host = HostRtlReAllocateHeap((nint)(long)ctx.Arg(0), ctx.Arg32(1),
-            (nint)(long)ctx.Arg(2), (nuint)ctx.Arg(3));
-        if (host == 0) ctx.SetLastError(Win32Error.NotEnoughMemory);
-        return (ulong)(long)host;
+        lock (ctx.Runtime.Memory.Gate)
+        {
+            var oldSize = ctx.Runtime.Memory.GetHostBlockSize(ctx.Arg(0), ctx.Arg(2));
+            if (!CheckHostAllocation(ctx, ctx.Arg(3), oldSize)) return 0;
+            var host = HostRtlReAllocateHeap((nint)(long)ctx.Arg(0), ctx.Arg32(1),
+                (nint)(long)ctx.Arg(2), (nuint)ctx.Arg(3));
+            if (host != 0) ctx.Runtime.Memory.TrackHostAllocation(ctx.Process.Id, ctx.Arg(0), ctx.Arg(2), (ulong)host, ChargeSize(ctx.Arg(3)));
+            if (host == 0) ctx.SetLastError(Win32Error.NotEnoughMemory);
+            return (ulong)(long)host;
+        }
     }
 
     [VirtualApi("kernel32.dll", "HeapSize", ApiCategory.Memory, "kernelbase!HeapSize", "ntdll!RtlSizeHeap")]
@@ -85,6 +98,35 @@ public static class HeapApis
         var hostSize = HostRtlSizeHeap((nint)(long)ctx.Arg(0), ctx.Arg32(1), (nint)(long)ctx.Arg(2));
         if (hostSize == unchecked((nuint)(-1))) ctx.SetLastError(Win32Error.InvalidParameter);
         return (ulong)hostSize;
+    }
+
+    private static ulong ChargeSize(ulong size) => (Math.Max(size, 1UL) + 15) & ~15UL;
+
+    private static ulong AllocationFailure(ApiCallContext ctx)
+    {
+        ctx.SetLastError(Win32Error.NotEnoughMemory);
+        if ((ctx.Arg32(1) & 4) == 0 || ctx.ReturnAddressSlot == 0) return 0;
+        // Raise HEAP_GENERATE_EXCEPTIONS only after the managed dispatcher returns, so guest
+        // SEH never unwinds through a CLR callback. Restore the original API return address.
+        var raise = ctx.Runtime.NativeApis.Resolve("ntdll.dll", "RtlRaiseStatus", null, out _);
+        if (raise == 0) return 0;
+        ctx.Write(ctx.ReturnAddressSlot, ctx.Runtime.Thunks.RegisterEntryStub([
+            0x48, 0xB8, .. BitConverter.GetBytes(ctx.ReturnAddress), // mov rax, return address
+            0x50,                                                // push rax
+            0xB9, .. BitConverter.GetBytes(NtStatus.NoMemory),     // mov ecx, STATUS_NO_MEMORY
+            0x48, 0xB8, .. BitConverter.GetBytes(raise),            // mov rax, RtlRaiseStatus
+            0xFF, 0xE0                                           // jmp rax
+        ]));
+        return 0;
+    }
+
+    private static bool CheckHostAllocation(ApiCallContext ctx, ulong size, ulong oldSize = 0)
+    {
+        if (size <= ulong.MaxValue - 16 &&
+            ctx.Runtime.Memory.CanAllocate(ChargeSize(size) > oldSize ? ChargeSize(size) - oldSize : 0,
+                ChargeSize(size) > oldSize ? ChargeSize(size) - oldSize : 0) && ctx.Runtime.Memory.PrepareHostAllocation()) return true;
+        ctx.SetLastError(Win32Error.NotEnoughMemory);
+        return false;
     }
 
     private static bool TryHeap(ApiCallContext ctx, out GuestHeap? heap)

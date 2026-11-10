@@ -1,3 +1,4 @@
+using ImaginedNT.Core.Io;
 using ImaginedNT.Core.Runtime;
 using Microsoft.Win32.SafeHandles;
 
@@ -52,6 +53,7 @@ internal sealed partial class CrtStdioState
             {
                 var shell = ctx.Process.TryGetEnvironmentVariable("COMSPEC", out var comspec)
                     ? comspec : "C:\\Windows\\System32\\cmd.exe";
+                _ = ctx.Process.FileSystem.MapPath(shell, ctx.Process.CurrentDirectory, FileOperation.Execute);
                 var image = ctx.Process.FileSystem.MapPath(shell, ctx.Process.CurrentDirectory);
                 if (!File.Exists(image)) image = Path.Combine(Environment.SystemDirectory, "cmd.exe");
                 child = ctx.Runtime.CreateProcess(new ProcessCreateOptions

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using ImaginedNT.Core.Diagnostics;
+using ImaginedNT.Core.Io;
 using ImaginedNT.Core.Pe;
 using ImaginedNT.Core.Runtime;
 
@@ -77,7 +78,7 @@ public static class Program
 
             Options:
               --sandbox <dir>       Host directory that backs C:\ (default: ./sandbox/process-<pid>)
-              --drive D=<dir>       Map a guest drive to a host directory (repeatable)
+              --drive D=<dir>       Map a drive to a directory or YAML; bare YAML uses a free drive
               --packaged            Simulate MSIX package identity using default/configured fields
               --unpackaged          Simulate a process without package identity (default)
               --package-identity <json> Load package identity from a JSON file and enable simulation
@@ -86,6 +87,7 @@ public static class Program
               --copyright <text>    Override the branding copyright string seen by the guest
               --product-name <text> Override the branding Windows product name
               --import <dll>        Import Virtual APIs or make a guest DLL available (repeatable)
+              --com-server <dll>    Register an in-process COM server DLL for CoGetClassObject (repeatable)
               --redirect-dll <a=b>   Redirect DLL a to DLL name or host path b (repeatable)
               --timeout <seconds>   Guest execution timeout (default: no timeout)
               --trace <file>        Write an event trace (JSONL) to <file>
@@ -98,6 +100,8 @@ public static class Program
               --syscalls            Rewrite and trap direct syscall instructions (opt-in)
               --wrap-native-handles Return ImaginedHandles for native NT handles
               --expand-managed-handles Expand supported managed handles for native NT calls
+              --max-physical-memory <bytes>  Shared guest committed-memory budget (0: unlimited)
+              --max-virtual-memory <bytes>   Shared guest virtual-memory reservation budget (0: unlimited)
               --job                 Apply an OS job object (memory limit, kill-on-close)
               --strict              Managed-only imports, no native forwarding, fail if unresolved
               --native-declared-only  Allow only declared native APIs; fail on anything else
@@ -207,6 +211,8 @@ public static class Program
         for (var i = 0; i < args.Length; i++)
         {
             var arg = args[i];
+            string? driveValue = null;
+            if (arg.StartsWith("--drive=", StringComparison.Ordinal)) { driveValue = arg[8..]; arg = "--drive"; }
             if (guestArgumentsOnly)
             {
                 guestArguments.Add(arg);
@@ -222,10 +228,15 @@ public static class Program
                     options.SandboxRoot = RequireValue(args, ref i, arg);
                     break;
                 case "--drive":
-                    var mapping = RequireValue(args, ref i, arg);
-                    if (mapping.Length < 3 || mapping[1] != '=' || char.ToUpperInvariant(mapping[0]) is < 'A' or > 'Z')
-                        throw new ArgumentException("--drive expects D=<host-directory>");
-                    options.Drives[char.ToUpperInvariant(mapping[0])] = new(mapping[2..]);
+                    var mapping = driveValue ?? RequireValue(args, ref i, arg);
+                    var explicitLetter = mapping.Length > 2 && mapping[1] == '=' && char.IsAsciiLetter(mapping[0]);
+                    var letter = explicitLetter ? char.ToUpperInvariant(mapping[0]) : Enumerable.Range('D', 23).Concat(Enumerable.Range('A', 2)).Select(c => (char)c).FirstOrDefault(c => !options.Drives.ContainsKey(c));
+                    if (letter == default || options.Drives.ContainsKey(letter)) throw new ArgumentException("drive already mapped or no free drive letter");
+                    var source = explicitLetter ? mapping[2..] : mapping;
+                    var yaml = Path.GetExtension(source).ToLowerInvariant() is ".yaml" or ".yml";
+                    if (!explicitLetter && !yaml) throw new ArgumentException("--drive expects D=<directory-or-yaml> or <yaml>");
+                    if (yaml) _ = DriveMapTable.Load(source);
+                    options.Drives[letter] = yaml ? new VirtualDriveOptions(".") { MapTablePath = Path.GetFullPath(source) } : new(source);
                     break;
                 case "--packaged":
                     options.IsPackaged = true;
@@ -259,6 +270,9 @@ public static class Program
                     break;
                 case "--import":
                     imports.Add(RequireValue(args, ref i, arg));
+                    break;
+                case "--com-server":
+                    options.ComServerPaths.Add(RequireValue(args, ref i, arg));
                     break;
                 case "--redirect-dll":
                     var redirect = RequireValue(args, ref i, arg);
@@ -299,6 +313,12 @@ public static class Program
                     break;
                 case "--expand-managed-handles":
                     options.ExpandManagedHandles = true;
+                    break;
+                case "--max-physical-memory":
+                    options.MaximumPhysicalMemoryBytes = ulong.Parse(RequireValue(args, ref i, arg), CultureInfo.InvariantCulture);
+                    break;
+                case "--max-virtual-memory":
+                    options.MaximumVirtualMemoryBytes = ulong.Parse(RequireValue(args, ref i, arg), CultureInfo.InvariantCulture);
                     break;
                 case "--job":
                     options.LimitJobObject = true;

@@ -236,75 +236,14 @@ public sealed class ImaginedThread : IDisposable
     }
 
     /// <summary>
-    /// Terminate the underlying guest thread.  A not-yet-started managed thread is simply marked
-    /// terminated.  A running managed thread is first stopped with TerminateThread; because that
-    /// call is unsupported for CLR threads and usually fails, the thread is also flagged for
-    /// cooperative unwind at its next managed API call (the dispatcher redirects the IAT return
-    /// address to the exit trampoline).
+    /// Stop managed guest threads through their exit trampoline at the next API boundary.
+    /// TerminateThread would also destroy CLR state owned by the hosting thread.
     /// </summary>
     public void Terminate(int exitCode = -1)
     {
         if (State is ThreadState.Exited or ThreadState.Terminated) return;
 
         RequestTermination(exitCode);
-
-        if (_managedHosted)
-        {
-            if (!HasStarted)
-            {
-                MarkExited(exitCode, ThreadState.Terminated);
-                return;
-            }
-
-            var handle = HostHandle;
-            if (handle == IntPtr.Zero)
-            {
-                // The managed thread body publishes its own handle.  Give it a moment to do so.
-                var deadline = Environment.TickCount64 + 2000;
-                while (handle == IntPtr.Zero && Volatile.Read(ref _finished) == 0 && Environment.TickCount64 < deadline)
-                {
-                    Thread.Sleep(1);
-                    handle = HostHandle;
-                }
-            }
-
-            var openedHere = false;
-            if (handle == IntPtr.Zero && NativeId != 0)
-            {
-                handle = NativeMethods.OpenThread(NativeMethods.THREAD_ALL_ACCESS, false, NativeId);
-                openedHere = handle != IntPtr.Zero;
-            }
-
-            var terminated = handle != IntPtr.Zero &&
-                             NativeMethods.TerminateThread(handle, unchecked((uint)exitCode));
-            if (openedHere) NativeMethods.CloseHandle(handle);
-
-            if (terminated)
-            {
-                MarkExited(exitCode, ThreadState.Terminated);
-                return;
-            }
-
-            if (Volatile.Read(ref _finished) == 0)
-            {
-                // Publish the requested state immediately so waiters and GetExitCodeThread see
-                // the termination, then let the guest unwind on its next managed API entry.
-                lock (_gate)
-                {
-                    ExitCode ??= exitCode;
-                    State = ThreadState.Terminated;
-                }
-                Process.Trace.Warn(
-                    $"managed guest thread {Id} (native {NativeId}) will stop at its next managed API call",
-                    Process.Id, Id);
-            }
-            return;
-        }
-
-        var nativeHandle = HostHandle;
-        if (nativeHandle == IntPtr.Zero) return;
-        if (NativeMethods.TerminateThread(nativeHandle, unchecked((uint)exitCode)))
-            MarkExited(exitCode, ThreadState.Terminated);
     }
 
     internal void RequestTermination(int exitCode)

@@ -20,6 +20,7 @@ internal static class EndToEndTests
         tests.Add(("E2E direct real ntdll syscall maps to managed NtClose", DirectRealSyscall));
         tests.Add(("E2E CPU spinner is stopped by the execution timeout", CpuSpinner));
         tests.Add(("E2E CreateProcessW spawns a child process", SpawnProcess));
+        tests.Add(("E2E managed COM object through CoCreateInstance", ManagedCom));
     }
 
     private static (HostResult Result, string Trace) RunSample(string sample, string sandbox, string trace,
@@ -279,6 +280,30 @@ internal static class EndToEndTests
             Assert.True(traceText.Contains("parent=", StringComparison.Ordinal), "trace records the parent pid");
             Assert.True(traceText.Contains("managed guest thread", StringComparison.Ordinal), "child runs on a managed thread");
             Assert.True(traceText.Contains("ExitProcess(123)", StringComparison.Ordinal), "child exit path is traced");
+        }
+        finally
+        {
+            try { Directory.Delete(sandbox, true); } catch { }
+        }
+    }
+
+    private static void ManagedCom()
+    {
+        TestHost.RequireSamples();
+        var sandbox = TestHost.NewTempDirectory("com");
+        var trace = Path.Combine(sandbox, "trace.jsonl");
+        try
+        {
+            var (result, traceText) = RunSample("comtest.exe", sandbox, trace, "--strict");
+            Assert.Equal(42, result.ExitCode, "COM demo exit code");
+            Assert.True(traceText.Contains("COM created Imagined.ComTest", StringComparison.Ordinal),
+                "trace shows a managed COM object");
+            Assert.True(traceText.Contains("com!IImaginedComTest!Add", StringComparison.Ordinal),
+                "trace shows managed vtable dispatch");
+            Assert.True(traceText.Contains("ole32!CoCreateInstance", StringComparison.Ordinal),
+                "trace shows managed CoCreateInstance");
+            Assert.True(traceText.Contains("oleaut32!#6", StringComparison.Ordinal),
+                "trace shows managed SysFreeString");
         }
         finally
         {

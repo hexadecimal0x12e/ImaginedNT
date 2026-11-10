@@ -255,6 +255,22 @@ public static class X64StubEmitter
         return c.ToArray();
     }
 
+    /// <summary>
+    /// Emit a COM forwarding trampoline. The guest calls the stub with <c>this</c> in RCX; the stub
+    /// replaces it with the host interface pointer and jumps to the host vtable entry, leaving all
+    /// other argument registers, XMM registers and the stack untouched.
+    /// </summary>
+    public static byte[] EmitComForwarder(ulong hostThis, ulong hostTarget)
+    {
+        var c = new CodeWriter(32);
+        c.Raw(0x48, 0xB9);                               // mov rcx, imm64
+        c.U64(hostThis);
+        c.Raw(0x48, 0xB8);                               // mov rax, imm64
+        c.U64(hostTarget);
+        c.Raw(0xFF, 0xE0);                               // jmp rax
+        return c.ToArray();
+    }
+
     public static byte[] EmitApiStub(ulong apiId, ulong stubAddress, ulong commonAddress)
     {
         var c = new CodeWriter(16);

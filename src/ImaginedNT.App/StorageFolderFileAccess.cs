@@ -1,7 +1,4 @@
-using System.Buffers.Binary;
-using System.ComponentModel;
 using System.Runtime.InteropServices;
-using System.Text;
 using ImaginedNT.Core.Diagnostics;
 using ImaginedNT.Core.Io;
 using Microsoft.Win32.SafeHandles;
@@ -11,12 +8,25 @@ using WinRT;
 
 namespace ImaginedNT.App;
 
+/// <summary>
+/// Host file access for folders granted by the folder picker.  The WinRT storage broker refuses
+/// to create or open some executable file types, so the virtual view keeps the normal
+/// <c>.exe</c>/<c>.dll</c> names while the broker only ever sees <c>.exec</c>/<c>.dllb</c>.
+/// Every path that crosses this boundary is translated in both directions; a legacy
+/// <c>.exe</c>/<c>.dll</c> that already exists is permanently renamed on first access so the
+/// broker never has to see it again.
+/// </summary>
 internal sealed class StorageFolderFileAccess : IHostFileSystemAccess
 {
+    private const string VirtualExecutableExtension = ".exe";
+    private const string BrokerExecutableExtension = ".exec";
+    private const string VirtualLibraryExtension = ".dll";
+    private const string BrokerLibraryExtension = ".dllb";
+
     private sealed record Grant(string Path, StorageFolder Folder);
     private readonly Dictionary<char, Grant> _roots = new();
-    private static readonly object ExecutableGate = new();
     private readonly TraceLog? _trace;
+    private static readonly object MigrationGate = new();
 
     public StorageFolderFileAccess(TraceLog? trace = null) => _trace = trace;
 
@@ -36,6 +46,70 @@ internal sealed class StorageFolderFileAccess : IHostFileSystemAccess
     }
 
     private static string Normalize(string path) => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
+
+    /// <summary>Map a virtual <c>.exe</c>/<c>.dll</c> path to the broker-visible <c>.exec</c>/<c>.dllb</c> name.</summary>
+    private static string ToBrokerPath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        if (string.Equals(extension, VirtualExecutableExtension, StringComparison.OrdinalIgnoreCase))
+            return Path.ChangeExtension(path, BrokerExecutableExtension)!;
+        if (string.Equals(extension, VirtualLibraryExtension, StringComparison.OrdinalIgnoreCase))
+            return Path.ChangeExtension(path, BrokerLibraryExtension)!;
+        return path;
+    }
+
+    /// <summary>Map a broker-returned <c>.exec</c>/<c>.dllb</c> name back to the virtual view.</summary>
+    private static string ToVirtualPath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        if (string.Equals(extension, BrokerExecutableExtension, StringComparison.OrdinalIgnoreCase))
+            return Path.ChangeExtension(path, VirtualExecutableExtension)!;
+        if (string.Equals(extension, BrokerLibraryExtension, StringComparison.OrdinalIgnoreCase))
+            return Path.ChangeExtension(path, VirtualLibraryExtension)!;
+        return path;
+    }
+
+    private static bool IsBrokerName(string path)
+    {
+        var extension = Path.GetExtension(path);
+        return string.Equals(extension, BrokerExecutableExtension, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(extension, BrokerLibraryExtension, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool NeedsMigration(string path)
+    {
+        var extension = Path.GetExtension(path);
+        return string.Equals(extension, VirtualExecutableExtension, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(extension, VirtualLibraryExtension, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Resolve a virtual file name to the name the broker is allowed to use.  Legacy
+    /// <c>.exe</c>/<c>.dll</c> files are renamed once, permanently, rather than being renamed back
+    /// after the operation finishes.
+    /// </summary>
+    private (string Path, bool Canonical) EnsureBrokerName(string virtualPath)
+    {
+        if (IsBrokerName(virtualPath)) return (virtualPath, true);
+        if (!NeedsMigration(virtualPath)) return (virtualPath, false);
+
+        var brokerPath = ToBrokerPath(virtualPath);
+        lock (MigrationGate)
+        {
+            var brokerItem = TryGetItem(brokerPath);
+            if (brokerItem is StorageFile) return (brokerPath, true);
+            if (brokerItem is not null) return (brokerPath, false);
+
+            var virtualItem = TryGetItem(virtualPath);
+            // A directory that happens to end in .exe/.dll is still a directory, not a PE file.
+            if (virtualItem is StorageFolder) return (virtualPath, true);
+            if (virtualItem is not StorageFile legacyFile) return (brokerPath, false);
+
+            Wait(legacyFile.RenameAsync(Path.GetFileName(brokerPath), NameCollisionOption.FailIfExists));
+            _trace?.Emit(TraceKind.File, $"migrated WinRT file name: '{virtualPath}' -> '{brokerPath}'");
+            return (brokerPath, true);
+        }
+    }
 
     private Grant? FindRoot(string path)
     {
@@ -57,57 +131,37 @@ internal sealed class StorageFolderFileAccess : IHostFileSystemAccess
         return relative == "." ? root.Folder : Wait(root.Folder.GetFolderAsync(relative), path);
     }
 
-    public HostFileInfo? TryGetInfo(string path)
+    private IStorageItem? TryGetItem(string path)
     {
         path = Normalize(path);
-        if (IsExecutable(path))
-        {
-            lock (ExecutableGate)
-            {
-                using var renamed = new TemporaryExecutable(this, path);
-                return renamed.File is null ? null : GetInfo(renamed.File) with { FullName = path };
-            }
-        }
         var root = FindRoot(path);
-        IStorageItem? item;
         if (root is not null)
         {
             var relative = Path.GetRelativePath(root.Path, path);
-            item = relative == "." ? root.Folder : Wait(root.Folder.TryGetItemAsync(relative), path);
+            return relative == "." ? root.Folder : Wait(root.Folder.TryGetItemAsync(relative), path);
         }
-        else
-        {
-            item = Wait(GetFolder(Path.GetDirectoryName(path)!).TryGetItemAsync(Path.GetFileName(path)), path);
-        }
+        return Wait(GetFolder(Path.GetDirectoryName(path)!).TryGetItemAsync(Path.GetFileName(path)), path);
+    }
+
+    public HostFileInfo? TryGetInfo(string path)
+    {
+        path = Normalize(path);
+        var (brokerPath, _) = EnsureBrokerName(path);
+        var item = TryGetItem(brokerPath);
         return item is null ? null : GetInfo(item);
     }
 
     public SafeFileHandle OpenHandle(string path, FileMode mode, FileAccess access, FileShare share, FileOptions options)
     {
         path = Normalize(path);
-        if (!IsExecutable(path)) return OpenHandleCore(path, mode, access, share, options);
-        lock (ExecutableGate)
-        {
-            using var renamed = new TemporaryExecutable(this, path);
-            var actualMode = renamed.File is null && mode is (FileMode.Create or FileMode.OpenOrCreate or FileMode.Append)
-                ? FileMode.CreateNew : mode;
-            var handle = OpenHandleCore(renamed.Path, actualMode, access, share, options & ~FileOptions.DeleteOnClose, true);
-            try
-            {
-                renamed.Restore(handle);
-                if ((options & FileOptions.DeleteOnClose) != 0)
-                {
-                    if (!SetFileInformationByHandle(handle, 4, [1], 1))
-                        throw new IOException($"无法设置文件关闭时删除：{path}", new Win32Exception(Marshal.GetLastPInvokeError()));
-                }
-                return handle;
-            }
-            catch { handle.Dispose(); throw; }
-        }
+        var (brokerPath, _) = EnsureBrokerName(path);
+        if (!brokerPath.Equals(path, StringComparison.Ordinal))
+            _trace?.Emit(TraceKind.File, $"WinRT storage name map: '{path}' -> '{brokerPath}'");
+        return OpenHandleCore(brokerPath, mode, access, share, options);
     }
 
     private SafeFileHandle OpenHandleCore(string path, FileMode mode, FileAccess access, FileShare share,
-        FileOptions options, bool allowRename = false)
+        FileOptions options)
     {
         var folder = GetFolder(Path.GetDirectoryName(path)!);
         uint creation = mode switch
@@ -126,7 +180,7 @@ internal sealed class StorageFolderFileAccess : IHostFileSystemAccess
             FileAccess.ReadWrite => 0x12019F,
             _ => throw new ArgumentOutOfRangeException(nameof(access))
         };
-        if (allowRename || (options & FileOptions.DeleteOnClose) != 0) desired |= 0x10000;
+        if ((options & FileOptions.DeleteOnClose) != 0) desired |= 0x10000;
         // Use the granted folder's COM interface, rather than reopening its absolute path.
         var hr = folder.As<IStorageFolderHandleAccess>().Create(Path.GetFileName(path), creation, desired,
             (uint)(share & ~FileShare.Inheritable), (uint)options, 0, out var handle);
@@ -141,82 +195,51 @@ internal sealed class StorageFolderFileAccess : IHostFileSystemAccess
     public HostFileInfo GetInfo(string path) => TryGetInfo(path) ??
         throw new FileNotFoundException($"找不到文件或目录：{path}", path);
 
-    private static HostFileInfo GetInfo(IStorageItem item)
+    private static HostFileInfo GetInfo(IStorageItem item, string? fullName = null)
     {
         var properties = Wait(item.GetBasicPropertiesAsync(), item.Path);
+        var isFolder = item.IsOfType(StorageItemTypes.Folder);
         var attributes = (System.IO.FileAttributes)item.Attributes;
         if (attributes == 0) attributes = System.IO.FileAttributes.Normal;
-        return new(item.Path, attributes, item.IsOfType(StorageItemTypes.Folder) ? 0 : checked((long)properties.Size),
+        // Folders keep their real name; only files are hidden behind the broker's file-type suffixes.
+        fullName ??= isFolder ? item.Path : ToVirtualPath(item.Path);
+        return new(fullName, attributes, isFolder ? 0 : checked((long)properties.Size),
             item.DateCreated.UtcDateTime, properties.DateModified.UtcDateTime, properties.DateModified.UtcDateTime);
     }
 
     public IEnumerable<HostFileInfo> EnumerateInfos(string path)
     {
         var folder = GetFolder(path);
-        lock (ExecutableGate)
+        var items = new List<IStorageItem>();
+        for (uint start = 0; ; start += 256)
         {
-            var items = new List<IStorageItem>();
-            for (uint start = 0; ; start += 256)
+            var page = Wait(folder.GetItemsAsync(start, 256), path);
+            items.AddRange(page);
+            if (page.Count < 256) break;
+        }
+
+        var result = new List<HostFileInfo>(items.Count);
+        // A legacy .exe sitting next to the canonical .exec maps to the same virtual name.
+        // Keep the canonical broker name so the virtual view never exposes duplicates.
+        var virtualFiles = new Dictionary<string, (IStorageItem Item, string VirtualPath, bool Canonical)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in items)
+        {
+            if (item.IsOfType(StorageItemTypes.Folder))
             {
-                var page = Wait(folder.GetItemsAsync(start, 256), path);
-                items.AddRange(page);
-                if (page.Count < 256) break;
+                result.Add(GetInfo(item));
+                continue;
             }
-            return items.Select(item => item.IsOfType(StorageItemTypes.File) && IsExecutable(item.Path)
-                ? GetInfo(item.Path) : GetInfo(item)).ToArray();
+
+            var (brokerPath, canonical) = EnsureBrokerName(item.Path);
+            var virtualPath = ToVirtualPath(brokerPath);
+            // Migration renames the file behind our back, so refresh the item before reading it.
+            var finalItem = brokerPath.Equals(item.Path, StringComparison.Ordinal) ? item : TryGetItem(brokerPath);
+            if (finalItem is null) continue;
+            if (!virtualFiles.TryGetValue(virtualPath, out var existing) || (canonical && !existing.Canonical))
+                virtualFiles[virtualPath] = (finalItem, virtualPath, canonical);
         }
-    }
-
-    private static bool IsExecutable(string path) => Path.GetExtension(path).Equals(".exe", StringComparison.OrdinalIgnoreCase);
-
-    private sealed class TemporaryExecutable : IDisposable
-    {
-        private readonly StorageFolderFileAccess _owner;
-        private readonly string _originalPath;
-        private bool _needsRestore;
-        public string Path { get; }
-        public StorageFile? File { get; }
-
-        public TemporaryExecutable(StorageFolderFileAccess owner, string path)
-        {
-            _owner = owner;
-            _originalPath = path;
-            Path = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path)!, $".imaginednt-{Guid.NewGuid():N}.exec");
-            try { File = Wait(owner.GetFolder(System.IO.Path.GetDirectoryName(path)!).GetFileAsync(System.IO.Path.GetFileName(path)), path); }
-            catch (FileNotFoundException) { return; }
-            Wait(File.RenameAsync(System.IO.Path.GetFileName(Path), NameCollisionOption.FailIfExists));
-            _needsRestore = true;
-        }
-
-        public void Restore(SafeFileHandle handle)
-        {
-            _needsRestore = true;
-            // Restore through the open handle so FileShare.None remains usable.
-            var offset = IntPtr.Size == 8 ? 20 : 12;
-            var name = Encoding.Unicode.GetBytes(_originalPath);
-            var buffer = new byte[offset + name.Length + 2];
-            BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(offset - 4), name.Length);
-            name.CopyTo(buffer, offset);
-            if (!SetFileInformationByHandle(handle, 3, buffer, (uint)buffer.Length))
-                throw new IOException($"无法恢复文件名：'{Path}' -> '{_originalPath}'", new Win32Exception(Marshal.GetLastPInvokeError()));
-            _needsRestore = false;
-        }
-
-        public void Dispose()
-        {
-            if (!_needsRestore) return;
-            try
-            {
-                var file = File ?? Wait(_owner.GetFolder(System.IO.Path.GetDirectoryName(Path)!).GetFileAsync(System.IO.Path.GetFileName(Path)), Path);
-                Wait(file.RenameAsync(System.IO.Path.GetFileName(_originalPath), NameCollisionOption.FailIfExists));
-                _needsRestore = false;
-            }
-            catch (Exception ex)
-            {
-                _owner._trace?.Error($"executable name restore failed: '{Path}' -> '{_originalPath}': {ex}");
-                throw new IOException($"临时文件名恢复失败，文件保留在 '{Path}'，原路径为 '{_originalPath}'。", ex);
-            }
-        }
+        foreach (var entry in virtualFiles.Values) result.Add(GetInfo(entry.Item, entry.VirtualPath));
+        return result;
     }
 
     public void CreateDirectory(string path)
@@ -231,13 +254,11 @@ internal sealed class StorageFolderFileAccess : IHostFileSystemAccess
 
     public void DeleteFile(string path)
     {
-        lock (ExecutableGate)
-        {
-            StorageFile file;
-            try { file = Wait(GetFolder(Path.GetDirectoryName(path)!).GetFileAsync(Path.GetFileName(path))); }
-            catch (FileNotFoundException) { return; }
-            Wait(file.DeleteAsync(StorageDeleteOption.PermanentDelete));
-        }
+        var (brokerPath, _) = EnsureBrokerName(Normalize(path));
+        StorageFile file;
+        try { file = Wait(GetFolder(Path.GetDirectoryName(brokerPath)!).GetFileAsync(Path.GetFileName(brokerPath))); }
+        catch (FileNotFoundException) { return; }
+        Wait(file.DeleteAsync(StorageDeleteOption.PermanentDelete));
     }
 
     public void DeleteDirectory(string path)
@@ -250,12 +271,11 @@ internal sealed class StorageFolderFileAccess : IHostFileSystemAccess
 
     public void Move(string source, string target, bool overwrite)
     {
-        lock (ExecutableGate)
-        {
-            var file = Wait(GetFolder(Path.GetDirectoryName(source)!).GetFileAsync(Path.GetFileName(source)));
-            Wait(file.MoveAsync(GetFolder(Path.GetDirectoryName(target)!), Path.GetFileName(target),
-                overwrite ? NameCollisionOption.ReplaceExisting : NameCollisionOption.FailIfExists));
-        }
+        var (brokerSource, _) = EnsureBrokerName(Normalize(source));
+        var (brokerTarget, _) = EnsureBrokerName(Normalize(target));
+        var file = Wait(GetFolder(Path.GetDirectoryName(brokerSource)!).GetFileAsync(Path.GetFileName(brokerSource)));
+        Wait(file.MoveAsync(GetFolder(Path.GetDirectoryName(brokerTarget)!), Path.GetFileName(brokerTarget),
+            overwrite ? NameCollisionOption.ReplaceExisting : NameCollisionOption.FailIfExists));
     }
 
     private static T Wait<T>(IAsyncOperation<T> operation, string? path = null)
@@ -303,9 +323,6 @@ internal sealed class StorageFolderFileAccess : IHostFileSystemAccess
             finally { operation.Close(); }
         }).WaitAsync(TimeSpan.FromSeconds(15)).GetAwaiter().GetResult();
     }
-
-    [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
-    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int informationClass, byte[] information, uint size);
 
     [ComImport, Guid("DF19938F-5462-48A0-BE65-D2A3271A08D6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     private interface IStorageFolderHandleAccess

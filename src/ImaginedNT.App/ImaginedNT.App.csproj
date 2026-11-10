@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <CETCompat>false</CETCompat>
@@ -25,6 +25,11 @@
     <ProjectReference Include="..\ImaginedNT.Apis\ImaginedNT.Apis.csproj" />
     <Content Include="..\..\samples\bin\shell.exe">
 			<Link>shell.exec</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Include="..\..\samples\bin\window.exe">
+      <Link>window.exec</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>

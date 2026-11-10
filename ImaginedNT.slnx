@@ -1,21 +1,32 @@
 <Solution>
-  <Project Path="src/ImaginedNT.App/ImaginedNT.App.csproj" Id="d387eae8-1aa5-4225-b985-ab2f6f2977bd">
-    <Platform Project="x64" />
-    <Deploy />
-  </Project>
-  <Project Path="src/ImaginedNT.Abstractions/ImaginedNT.Abstractions.csproj" />
-  <Project Path="src/ImaginedNT.Apis.Common/ImaginedNT.Apis.Common.csproj" />
-  <Project Path="src/ImaginedNT.Apis.Crt/ImaginedNT.Apis.Crt.csproj" />
-  <Project Path="src/ImaginedNT.Apis.File/ImaginedNT.Apis.File.csproj" />
-  <Project Path="src/ImaginedNT.Apis.Memory/ImaginedNT.Apis.Memory.csproj" />
-  <Project Path="src/ImaginedNT.Apis.Package/ImaginedNT.Apis.Package.csproj" />
-  <Project Path="src/ImaginedNT.Apis.Process/ImaginedNT.Apis.Process.csproj" />
-  <Project Path="src/ImaginedNT.Apis.Registry/ImaginedNT.Apis.Registry.csproj" />
-  <Project Path="src/ImaginedNT.Apis.Synchronization/ImaginedNT.Apis.Synchronization.csproj" />
-  <Project Path="src/ImaginedNT.Apis.System/ImaginedNT.Apis.System.csproj" />
-  <Project Path="src/ImaginedNT.Apis/ImaginedNT.Apis.csproj" />
-  <Project Path="src/ImaginedNT.Backends.Windows/ImaginedNT.Backends.Windows.csproj" />
-  <Project Path="src/ImaginedNT.Core/ImaginedNT.Core.csproj" />
-  <Project Path="src/ImaginedNT.Host/ImaginedNT.Host.csproj" />
-  <Project Path="tests/ImaginedNT.Tests/ImaginedNT.Tests.csproj" />
+  <Folder Name="/0. Core/">
+    <Project Path="src/ImaginedNT.Abstractions/ImaginedNT.Abstractions.csproj" />
+    <Project Path="src/ImaginedNT.Backends.Windows/ImaginedNT.Backends.Windows.csproj" />
+    <Project Path="src/ImaginedNT.Core/ImaginedNT.Core.csproj" />
+  </Folder>
+  <Folder Name="/1. API/">
+    <Project Path="src/ImaginedNT.Apis.Com/ImaginedNT.Apis.Com.csproj" />
+    <Project Path="src/ImaginedNT.Apis.Common/ImaginedNT.Apis.Common.csproj" />
+    <Project Path="src/ImaginedNT.Apis.Crt/ImaginedNT.Apis.Crt.csproj" />
+    <Project Path="src/ImaginedNT.Apis.File/ImaginedNT.Apis.File.csproj" />
+    <Project Path="src/ImaginedNT.Apis.Memory/ImaginedNT.Apis.Memory.csproj" />
+    <Project Path="src/ImaginedNT.Apis.Package/ImaginedNT.Apis.Package.csproj" />
+    <Project Path="src/ImaginedNT.Apis.Process/ImaginedNT.Apis.Process.csproj" />
+    <Project Path="src/ImaginedNT.Apis.Registry/ImaginedNT.Apis.Registry.csproj" />
+    <Project Path="src/ImaginedNT.Apis.Synchronization/ImaginedNT.Apis.Synchronization.csproj" />
+    <Project Path="src/ImaginedNT.Apis.System/ImaginedNT.Apis.System.csproj" />
+    <Project Path="src/ImaginedNT.Apis/ImaginedNT.Apis.csproj" />
+    <Project Path="tests/ImaginedNT.Tests/ImaginedNT.Tests.csproj" />
+  </Folder>
+  <Folder Name="/2. App/">
+    <Project Path="src/ImaginedNT.FullTrustApp/ImaginedNT.FullTrustApp.csproj" Id="d5322a63-0af0-4bb1-bc1c-0efe57fa9caf">
+      <Platform Project="x64" />
+      <Deploy />
+    </Project>
+    <Project Path="src/ImaginedNT.App/ImaginedNT.App.csproj" Id="d387eae8-1aa5-4225-b985-ab2f6f2977bd">
+      <Platform Project="x64" />
+      <Deploy />
+    </Project>
+    <Project Path="src/ImaginedNT.Host/ImaginedNT.Host.csproj" />
+  </Folder>
 </Solution>

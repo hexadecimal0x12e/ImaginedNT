@@ -2,6 +2,7 @@ namespace ImaginedNT.Core.Io;
 
 public sealed record VirtualDriveOptions(string HostDirectory)
 {
+    public string? MapTablePath { get; init; }
     public string Label { get; init; } = "ImaginedNT";
     public uint? SerialNumber { get; init; }
     public ulong TotalBytes { get; init; } = 128UL * 1024 * 1024 * 1024;
@@ -14,14 +15,17 @@ public sealed class VirtualDrive
     {
         if (options.FreeBytes > options.TotalBytes || options.TotalBytes / 4096 > uint.MaxValue)
             throw new ArgumentException("invalid simulated drive capacity");
+        MapTable = string.IsNullOrWhiteSpace(options.MapTablePath) ? null : DriveMapTable.Load(options.MapTablePath);
+        if (MapTable is not null) options = MapTable.Options;
         Letter = letter;
         HostDirectory = Path.GetFullPath(options.HostDirectory);
         Label = options.Label;
-        SerialNumber = options.SerialNumber ?? (0x494E5400u + (uint)(letter - 'A'));
+        SerialNumber = options.SerialNumber ?? (0x12345678u + (uint)(letter - 'A'));
         TotalBytes = options.TotalBytes / 4096 * 4096;
         FreeBytes = options.FreeBytes / 4096 * 4096;
     }
 
+    public DriveMapTable? MapTable { get; }
     public char Letter { get; }
     public string RootPath => $"{Letter}:\\";
     public string DevicePath => $@"\Device\ImaginedDrive{(Letter == 'C' ? 0 : Letter - 'A' + 1)}";

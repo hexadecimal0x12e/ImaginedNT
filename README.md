@@ -1,22 +1,21 @@
 # ImaginedNT
 
 > [!WARNING]
-> 
-> Still under development ~~vibing~~. 
+> Still under development ~~vibing~~. Very unstable and host crashes everyday.
+> Even with further developemnt, still DO NOT use in real production scenarios.  The API surface is incomplete, the implementation is not hardened, and the runtime is not yet stable.
+> Also we can't grantee that the guest application will run correctly even guset can pass through the managed NT layer.  
 
-A User-State NT Kernel **simulator**, which can run real Windows NT PE images (including Microsoft Windows, Wine and ReactOS) in a managed sandbox. 
+A User-State NT Kernel **simulator**, which simulates (or route calls, see below) almost everything in User-State of Windows NT and some in Kernal-State. 
+
+It can run real Windows NT PE images (including Microsoft Windows, Wine and ReactOS) in a managed sandbox with GUI support. 
 
 ## What it is
 
-ImaginedNT loads a real Windows NT PE image, maps it into a managed address space, applies
-base relocations, resolves and patches the IAT, and routes every intercepted API call or direct
-`syscall` into the managed layer **`ImaginedNT.Core`**. The layer either implements the call in
-C# or forwards it to the host's real `kernel32`/`ntdll`/other DLLs.
+ImaginedNT loads a real Windows NT PE image, maps it into a managed address space, applies base relocations, resolves and patches the IAT, and routes every intercepted API call or direct `syscall` into the managed layer **`ImaginedNT.Core`**. The layer either implements the call in C# or forwards it to the host's real `kernel32`/`ntdll`/other DLLs.
 
-This is a working proof-of-concept, not a drop-in Wine replacement. It runs real
-MSVC-generated, CRT-free PE executables end to end, including a multi-threaded guest, managed
-file I/O, virtual memory, IAT shadowing, base relocation, native forwarding, and direct syscall
-interception.
+This is a working proof-of-concept, not a drop-in Wine replacement. It runs real MSVC-generated, most of which are CRT-free PE executables end to end, including a multi-threaded guest, managed file I/O and virtual file system, virtual memory, IAT shadowing, base relocation, native forwarding, and direct syscall interception.
+
+There is also GUI Support for `CreateWindowEx`, `ShowWindow`, `SetPixel`, `GetPixel` and other basic GDI APIs, which allows running simple GUI applications.
 
 ## Quick start
 
@@ -57,6 +56,9 @@ dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin
 
 # CreateProcessW: the parent creates a suspended child, resumes it, waits and checks its exit code
 dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin/spawn.exe --strict --verbose
+
+# A managed COM object created through the real COM ABI (CoInitializeEx/CoCreateInstance/vtable calls)
+dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin/comtest.exe --strict --verbose
 
 # Inspect a PE without executing it
 dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll inspect samples/bin/hello.exe
@@ -205,6 +207,117 @@ options.DllRedirects["old.dll"] = @"D:\compat\replacement.dll";
 using var runtime = BuiltinApis.CreateRuntime(options);
 ```
 
+## COM support
+
+`ImaginedNT.Apis.Com` adds a managed COM runtime on top of the same dispatch machinery used for
+virtual APIs. It simulates the in-process COM pieces a guest normally gets from `ole32`/`combase`:
+
+- apartment initialization (`CoInitialize`, `CoInitializeEx`, `CoUninitialize`,
+  `CoGetApartmentType`, `CoInitializeSecurity`),
+- object activation (`CoCreateInstance`, `CoCreateInstanceEx`, `CoGetClassObject`),
+- class factories (`CreateInstance`, `LockServer`) and guest `CoRegisterClassObject` factories,
+- COM task memory and GUID helpers (`CoTaskMemAlloc`/`Free`/`ReAlloc`, `CoCreateGuid`,
+  `StringFromCLSID`/`StringFromIID`, `CLSIDFromString`/`IIDFromString`),
+- in-process server library loading (`CoLoadLibrary`, `CoFreeLibrary`, `CoFreeUnusedLibraries`,
+  plus `DllGetClassObject`/`DllCanUnloadNow` for registered servers),
+- BSTR helpers (`SysAllocString`, `SysAllocStringLen`, `SysFreeString`, `SysStringLen`,
+  `SysStringByteLen`), including the `oleaut32` ordinal aliases emitted by the MSVC import
+  library.
+
+Marshaling is intentionally simple because the guest runs in the host address space: GUIDs,
+interface pointers, strings and BSTRs are ordinary pointers, and an interface is a guest-readable
+pointer to a vtable whose entries point at managed thunks.
+
+### Fully managed ("Virtual API"-style) COM
+
+Declare the ABI on a C# interface with `[VirtualComInterface]` and `[VirtualComMethod]`, implement
+it on a `[VirtualComClass]` class, and call `CoCreateInstance` from the guest. No host COM
+registration is involved; every vtable slot runs in C#.
+
+```csharp
+[VirtualComInterface("{4D2C9A10-7B3E-4F1A-9C22-5D771B8E4A61}", "IImaginedComTest")]
+public interface IImaginedComTest
+{
+    [VirtualComMethod("{4D2C9A10-7B3E-4F1A-9C22-5D771B8E4A61}", 3, "Add")]
+    ulong Add(ComCallContext context);          // HRESULT Add(int a, int b, int* result)
+    // ...
+}
+
+[VirtualComClass("{E7A1B2C3-4D5E-6F70-8192-A3B4C5D6E7F8}", "Imagined.ComTest")]
+public sealed class ImaginedComTestObject : IImaginedComTest
+{
+    public ulong Add(ComCallContext context)
+    {
+        var result = context.Arg(3);
+        if (result == 0) return ComHResult.AsReturnValue(ComHResult.E_POINTER);
+        context.WriteInt32(3, context.ArgInt32(1) + context.ArgInt32(2));
+        return ComHResult.AsReturnValue(ComHResult.S_OK);
+    }
+}
+```
+
+`src/ImaginedNT.Apis.Com/ImaginedComTest.cs` is the complete, simplest example, and
+`samples/comtest/comtest.c` drives it with hand-written COM vtables:
+`CoInitializeEx` → `CoCreateInstance` → `Add`/`SetValue`/`GetValue`/`GetName` →
+`QueryInterface(IUnknown)` → `AddRef`/`Release` → `CoUninitialize`. It is built without a CRT and
+works under `--strict`.
+
+### Partially Imagined COM
+
+`[PartiallyImaginedComClass(guestClsid, hostClsid)]` creates a guest-visible object whose
+overridden slots run in C# and whose remaining slots jump straight to a real host COM object.
+Mark overrides with `[PartiallyImaginedComMethod]` (or `[VirtualComMethod]`):
+
+```csharp
+[PartiallyImaginedComClass("{...guest...}", "{...host...}", "Imagined.ComPartialTest")]
+public sealed class PartialComTest
+{
+    [PartiallyImaginedComMethod("IImaginedComTest", 3, "Add")]
+    public ulong Add(ComCallContext context) => /* managed replacement */;
+    // GetValue/SetValue/GetName are forwarded to the host object's vtable.
+}
+```
+
+The runtime obtains the host interface pointers either from a host CLSID through real
+`ole32!CoCreateInstance` or from a factory registered with
+`runtime.Com.RegisterHostClass(hostClsid, iid => hostInterfacePointer)`. Non-overridden slots are
+emitted as tiny x64 trampolines that replace `this` with the host interface pointer and `jmp` to
+the host vtable entry, leaving all other arguments, XMM registers and the stack untouched.
+
+A managed object exposed as the host through a CLR CCW must declare its interface methods with
+`[PreserveSig]`; otherwise the CLR adds an extra `[out, retval]` parameter and the native vtable
+layout no longer matches the guest interface. Native host COM components do not need this.
+
+Aggregation (`pUnkOuter`) is rejected with `CLASS_E_NOAGGREGATION`. Partial objects support
+`QueryInterface` only for interfaces declared on the managed class.
+
+### COM servers and libraries
+
+- `CoGetClassObject` returns a managed `IClassFactory` for `[VirtualComClass]` and
+  `[PartiallyImaginedComClass]` classes; `CreateInstance` and `LockServer` participate in the
+  managed lock accounting.
+- Register an in-process server DLL with `--com-server <dll>` (repeatable) or
+  `RuntimeOptions.ComServerPaths`. Servers are loaded lazily per guest process; `CoGetClassObject`
+  calls their `DllGetClassObject`, and `CoFreeUnusedLibraries` asks `DllCanUnloadNow`.
+- Guest code can register its own factory with `CoRegisterClassObject` and revoke it with
+  `CoRevokeClassObject`; `CoCreateInstance` calls the guest factory's `CreateInstance`.
+- If no managed class, server or guest factory matches a CLSID, `CoCreateInstance` falls back to
+  the host's real COM registry when native forwarding is enabled (not under `--strict`).
+
+```powershell
+dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run app.exe --com-server samples\bin\myserver.dll
+```
+
+### COM limitations
+
+There is no DCOM/out-of-process activation, marshaling/proxy support, `IDispatch`/type-library
+handling, cross-apartment marshaling, OLE embedding or drag/drop. An object declared with
+`ComThreadingModel.Apartment` rejects calls from another thread with `RPC_E_WRONG_THREAD`; other
+models are callable from any thread. `CoCreateInstanceEx` is local-only and rejects
+`COSERVERINFO`. Guest-mapped server DLLs are never unloaded (matching `FreeLibrary`), while host
+server DLLs are unloaded when `DllCanUnloadNow` agrees. See
+[docs/API-COVERAGE.md](docs/API-COVERAGE.md) for the exact API list.
+
 ## Simulated MSIX package identity
 
 Guests have no package identity by default, independently of the host's packaging.
@@ -280,29 +393,27 @@ left to the host's `winbrand.dll`.
 | PE32+ parsing (headers, sections, imports, exports, relocations, TLS directory) | ✅ |
 | Map image, copy sections, apply `DIR64`/`HIGHLOW`/`HIGH`/`LOW` relocations | ✅ |
 | IAT patching to managed thunks or native exports | ✅ |
+| Guest DLL loading: map, relocate, patch imports, call `DllMain`, resolve exports | ✅ |
 | Managed↔native import policy (`managed-first`, `managed-only`, `native-first`) | ✅ |
+| Direct `syscall` trap via VEH + real ntdll syscall-number discovery | ✅ |
+| Real `NtClose` syscall number read from ntdll and emulated by managed `NtClose` | ✅ |
 | Real MSVC CRT-free PE execution on a real host thread | ✅ |
 | Managed `WriteFile`/`GetStdHandle`/`ExitProcess` end to end | ✅ |
 | Virtual memory reserve/commit/protect/query/free, `VirtualAlloc`/`VirtualQuery` | ✅ |
 | NT object namespace, symbolic links, handle table, access masks | ✅ |
 | Events, mutants, semaphores, named objects, waits | ✅ |
-| Sandboxed `C:` filesystem, NT file handles, read/write/query information | ✅ |
-| Directory enumeration (`FindFirstFileW`/`FindNextFileW`/`FindClose`) | ✅ |
-| Guest mini cmd shell (`samples/bin/shell.exe`) for FS/process testing | ✅ |
-| Real Windows `cmd.exe` startup, builtin commands (`echo`, `dir`, `cd`, `ver`, `type`, `set`), `/c` and redirected stdin | ✅ |
-| Guest threads (`CreateThread`, wait, exit codes), per-thread last error | ✅ |
-| Guest threads hosted on C# managed threads, one owner process per thread | ✅ |
-| `CreateProcessA`/`CreateProcessW`/`WinExec`, `PROCESS_INFORMATION`, `CREATE_SUSPENDED` | ✅ |
-| Multiple imagined processes in one host, process/thread handles and waits | ✅ |
 | CPU-bound guest watchdog (`--timeout`, exit code 124) | ✅ |
-| Direct `syscall` trap via VEH + real ntdll syscall-number discovery | ✅ |
-| Real `NtClose` syscall number read from ntdll and emulated by managed `NtClose` | ✅ |
-| Guest DLL loading: map, relocate, patch imports, call `DllMain`, resolve exports | ✅ |
-| Native forwarding for APIs not implemented in C# | ✅ |
+| Guest threads (`CreateThread`, wait, exit codes), per-thread last error | ✅ |
+| Multiple imagined processes in one host, APIs like `CreateProcessA`, process/thread handles and waits | ✅ |
+| Sandboxed filesystem, NT file handles, read/write/query information | ✅ |
+| Directory enumeration (`FindFirstFileW`/`FindNextFileW`/`FindClose`) | ✅ |
+| Real Windows `cmd.exe` startup, builtin commands (`echo`, `dir`, `cd`, `ver`, `type`, `set`), `/c` and redirected stdin | ✅ |
+| Managed COM: apartments, class factories, guest vtables, partial forwarding, servers | ✅ (in-process subset) |
+| Basic GUI and GDI Application support (`CreateWindowEx`, `ShowWindow`, `SetPixel`, `GetPixel`) | ✅ |
 | OS job-object backstop (memory/process limits, kill-on-close) | ✅ (opt-in) |
-| Multi-process isolation by running each guest app in its own host process | ✅ |
+| Native forwarding for APIs not implemented in C# | ✅ |
 | In-host child processes share one address space (not an isolation boundary) | ⚠️ by design |
-| Full CRT/PEB/TEB/SEH/registry/COM/GDI, 32-bit, cross-host process trees | ❌ |
+| Full CRT/PEB/TEB/SEH/registry/GDI, DCOM/proxies, 32-bit, cross-host process trees | ❌ |
 
 See [docs/LIMITATIONS-AND-SECURITY.md](docs/LIMITATIONS-AND-SECURITY.md) before using this with
 untrusted code, and [docs/PORTING.md](docs/PORTING.md) for how the layers map onto another host
@@ -378,6 +489,7 @@ src/ImaginedNT.Abstractions/    NT types, object/file contracts, API attributes,
 src/ImaginedNT.Backends.Windows/ Windows interop, memory, filesystem, objects, PE mapping, thunks
 src/ImaginedNT.Core/            Runtime, processes/threads, API registry/scanner, syscall dispatch
 src/ImaginedNT.Apis.Common/     Shared API argument/result helpers
+src/ImaginedNT.Apis.Com/        Managed COM runtime APIs, BSTR helpers and the test COM class
 src/ImaginedNT.Apis.Crt/        Partially Imagined CRT APIs and per-process guest string caches
 src/ImaginedNT.Apis.System/     Identity, console, environment, time, guest DLL APIs
 src/ImaginedNT.Apis.Package/    Simulated MSIX identity, package queries and ID conversions
@@ -449,3 +561,6 @@ scripts/                    Build/test/sample helpers
 - MSVC + `ml64` only if you rebuild the sample PEs
 - PowerShell 7 for the helper scripts (Windows PowerShell 5.1 is likely fine too)
 
+## License
+
+Apache 2.0, see [LICENSE](LICENSE) for details.

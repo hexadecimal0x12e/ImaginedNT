@@ -30,17 +30,17 @@ function Build-C($name, $libraries = 'kernel32.lib') {
     $src = Join-Path $PSScriptRoot "$name\$name.c"
     $obj = Join-Path $bin "$name.obj"
     $exe = Join-Path $bin "$name.exe"
-    $cmd = '"{0}" >nul 2>&1 && cl /nologo /c /O1 /GS- /guard:cf- /Zl "{1}" /Fo:"{2}" && link /nologo /NODEFAULTLIB /SUBSYSTEM:CONSOLE /ENTRY:NtEntry /OUT:"{3}" "{2}" {4}' -f $vcvars, $src, $obj, $exe, $libraries
+    $cmd = '"{0}" >nul 2>&1 && cl /nologo /utf-8 /c /O1 /GS- /guard:cf- /Zl "{1}" /Fo:"{2}" && link /nologo /NODEFAULTLIB /SUBSYSTEM:CONSOLE /ENTRY:NtEntry /OUT:"{3}" "{2}" {4}' -f $vcvars, $src, $obj, $exe, $libraries
     cmd /c $cmd
     if ($LASTEXITCODE -ne 0) { throw "failed to build $name" }
     Write-Host "built $exe"
 }
 
-function Build-Dll($name) {
+function Build-Dll($name, $libraries = 'kernel32.lib') {
     $src = Join-Path $PSScriptRoot "$name\$name.c"
     $obj = Join-Path $bin "$name.obj"
     $dll = Join-Path $bin "$name.dll"
-    $cmd = '"{0}" >nul 2>&1 && cl /nologo /c /O1 /GS- /guard:cf- /Zl "{1}" /Fo:"{2}" && link /nologo /NODEFAULTLIB /DLL /ENTRY:DllMain /OUT:"{3}" "{2}" kernel32.lib' -f $vcvars, $src, $obj, $dll
+    $cmd = '"{0}" >nul 2>&1 && cl /nologo /utf-8 /c /O1 /GS- /guard:cf- /Zl "{1}" /Fo:"{2}" && link /nologo /NODEFAULTLIB /DLL /ENTRY:DllMain /OUT:"{3}" "{2}" {4}' -f $vcvars, $src, $obj, $dll, $libraries
     cmd /c $cmd
     if ($LASTEXITCODE -ne 0) { throw "failed to build $name.dll" }
     Write-Host "built $dll"
@@ -59,7 +59,7 @@ function Build-Asm($name) {
 Build-C 'hello'
 Build-C 'threads'
 Build-C 'fileio'
-Build-C 'memory'
+Build-C 'memory' 'kernel32.lib ntdll.lib'
 Build-C 'native'
 Build-C 'reloc'
 Build-C 'spin'
@@ -67,8 +67,12 @@ Build-C 'dllhost'
 Build-C 'child'
 Build-C 'spawn'
 Build-C 'shell'
+Build-C 'window' 'user32.lib'
+Build-C 'gdi' 'kernel32.lib user32.lib gdi32.lib'
+Build-C 'comtest' 'ole32.lib oleaut32.lib kernel32.lib'
 Build-C 'failfast' 'kernel32.lib ucrt.lib'
 Build-Dll 'helper'
+Build-Dll 'comserver' 'kernel32.lib oleaut32.lib'
 Build-Dll 'failfastdll'
 Build-Asm 'syscall'
 
@@ -78,7 +82,7 @@ $directAsm = Join-Path $PSScriptRoot 'directsyscall\syscall_helper.asm'
 $directObj = Join-Path $bin 'directsyscall.obj'
 $helperObj = Join-Path $bin 'syscall_helper.obj'
 $directExe = Join-Path $bin 'directsyscall.exe'
-$cmd = '"{0}" >nul 2>&1 && cl /nologo /c /O1 /GS- /guard:cf- /Zl "{1}" /Fo:"{2}" && ml64 /nologo /c /Fo "{3}" "{4}" && link /nologo /NODEFAULTLIB /SUBSYSTEM:CONSOLE /ENTRY:NtEntry /OUT:"{5}" "{2}" "{3}" kernel32.lib' -f $vcvars, $directSrc, $directObj, $helperObj, $directAsm, $directExe
+$cmd = '"{0}" >nul 2>&1 && cl /nologo /utf-8 /c /O1 /GS- /guard:cf- /Zl "{1}" /Fo:"{2}" && ml64 /nologo /c /Fo "{3}" "{4}" && link /nologo /NODEFAULTLIB /SUBSYSTEM:CONSOLE /ENTRY:NtEntry /OUT:"{5}" "{2}" "{3}" kernel32.lib' -f $vcvars, $directSrc, $directObj, $helperObj, $directAsm, $directExe
 cmd /c $cmd
 if ($LASTEXITCODE -ne 0) { throw 'failed to build directsyscall' }
 Write-Host "built $directExe"

@@ -1,0 +1,19 @@
+<Page
+    x:Class="ImaginedNT.FullTrustApp.Pages.ProcessesPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Loaded="OnLoaded" Unloaded="OnUnloaded">
+    <Grid ColumnSpacing="16" RowSpacing="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="2*" />
+            <ColumnDefinition Width="3*" />
+        </Grid.ColumnDefinitions>
+        <Button x:Name="AddProcessButton" Grid.ColumnSpan="2" Content="添加进程" Click="OnAddProcessClicked" IsEnabled="False" />
+        <ListView Grid.Row="1" x:Name="ProcessList" SelectionChanged="OnProcessSelected" />
+        <TextBox Grid.Row="1" Grid.Column="1" x:Name="ProcessDetails" IsReadOnly="True" AcceptsReturn="True" FontFamily="Consolas" TextWrapping="Wrap" Header="进程详情 · 线程 / 模块 / 句柄 / 内存" ScrollViewer.VerticalScrollBarVisibility="Auto" />
+    </Grid>
+</Page>

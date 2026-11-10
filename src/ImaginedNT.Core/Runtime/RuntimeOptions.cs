@@ -110,6 +110,13 @@ public sealed class RuntimeOptions
     /// <summary>按 DLL 文件名重定向到另一个 DLL 名称或宿主路径；在创建运行时时读取。</summary>
     public Dictionary<string, string> DllRedirects { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 注册为进程内 COM 服务器的 DLL（来宾沙箱路径或宿主路径）。服务器在首次解析 CLSID 时
+    /// 惰性加载，并通过其 <c>DllGetClassObject</c>/<c>DllCanUnloadNow</c> 导出参与
+    /// <c>CoGetClassObject</c> 与 <c>CoFreeUnusedLibraries</c>。
+    /// </summary>
+    public List<string> ComServerPaths { get; } = new();
+
     /// <summary>是否在导入无法解析时使加载失败；默认为 false，此时生成返回入口点未找到状态的占位函数。</summary>
     public bool FailOnUnresolvedImport { get; set; }
 
@@ -121,6 +128,12 @@ public sealed class RuntimeOptions
 
     /// <summary>启用作业对象限制时，每个宿主进程的内存上限，单位为字节，默认为 512 MiB。</summary>
     public ulong JobMemoryLimitBytes { get; set; } = 512UL * 1024 * 1024;
+
+    /// <summary>同一运行时内所有来宾的已提交内存额度（字节），不包含宿主开销；0 不限制。</summary>
+    public ulong MaximumPhysicalMemoryBytes { get; set; }
+
+    /// <summary>同一运行时内所有来宾的虚拟内存预留额度（字节），不包含宿主预留空间；0 不限制。</summary>
+    public ulong MaximumVirtualMemoryBytes { get; set; }
 
     /// <summary>启用作业对象限制时，作业中的最大活动进程数，默认为 1；设为 0 时仍按 1 处理。</summary>
     public uint JobActiveProcessLimit { get; set; } = 1;
@@ -213,7 +226,7 @@ public sealed class RuntimeOptions
     public static RuntimeOptions ForTests(Stream? stdout = null) => new()
     {
         SandboxRoot = Path.Combine(Path.GetTempPath(), "imaginednt-tests", Guid.NewGuid().ToString("N")),
-        StandardOu、tput = stdout ?? new MemoryStream(),
+        StandardOutput = stdout ?? new MemoryStream(),
         StandardError = new MemoryStream(),
         StandardInput = new MemoryStream(),
         TerminationMode = ProcessTerminationMode.ReturnToHost,

@@ -1,0 +1,21 @@
+ImaginedNT VirtFS MapTable: v1
+Label: ImaginedNT Virtual Root FS
+Serial: AAAA-BBBB
+MaximumSpace: 10240
+Readonly: true
+Inherit: true
+Default: -read,-write,+enum,-execute,-delete
+HostRoot: C:\
+Initials:
+  -<not_allow>: -read,-enum,-write,-execute,-delete
+FS:
+  -Windows:
+    -<self>: +read,+enum,-write,-execute,-delete
+    -system32:
+      -*.exe: +execute
+      -config: +exclude
+    -*.exe: +execute
+    -explorer.exe: -execute
+    -**\*.dll: +execute,+enum
+    -<left>: <not_allow>
+  -<left>: +exclude

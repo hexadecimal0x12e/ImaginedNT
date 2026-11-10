@@ -19,12 +19,11 @@ public static class MemoryApis
         if (!IsCurrentProcessHandle(ctx, ctx.Arg(0))) return NtStatus.InvalidHandle;
         var basePtr = ctx.Arg(1);
         var sizePtr = ctx.Arg(3);
-        if (sizePtr == 0) return NtStatus.InvalidParameter;
-        var requestedBase = basePtr == 0 ? 0UL : ctx.Read<ulong>(basePtr);
+        if (basePtr == 0 || sizePtr == 0 || ctx.Arg(2) != 0) return NtStatus.InvalidParameter;
+        var requestedBase = ctx.Read<ulong>(basePtr);
         var size = ctx.Read<ulong>(sizePtr);
         var allocationType = (AllocationType)ctx.Arg32(4);
         var protection = (MemoryProtection)ctx.Arg32(5);
-        if (protection == 0) protection = MemoryProtection.ReadWrite;
         var status = ctx.Process.Memory.TryAllocate(requestedBase, size, protection, allocationType,
             out var actualBase, out var actualSize, "NtAllocateVirtualMemory");
         if (NtStatus.IsSuccess(status))
@@ -44,11 +43,14 @@ public static class MemoryApis
         if (basePtr == 0 || sizePtr == 0) return NtStatus.InvalidParameter;
         var address = ctx.Read<ulong>(basePtr);
         var size = ctx.Read<ulong>(sizePtr);
-        var status = ctx.Process.Memory.TryFree(address, size, (FreeType)ctx.Arg32(3));
+        var freeType = (FreeType)ctx.Arg32(3);
+        var allocationSize = ctx.Memory.FindRegion(address)?.AllocationSize ?? 0;
+        var status = ctx.Process.Memory.TryFree(address, size, freeType);
         if (NtStatus.IsSuccess(status))
         {
-            ctx.Memory.Write(basePtr, address);
-            ctx.Memory.Write(sizePtr, 0UL);
+            var start = address & ~(VirtualMemoryManager.PageSize - 1);
+            ctx.Memory.Write(basePtr, start);
+            ctx.Memory.Write(sizePtr, size == 0 ? allocationSize : VirtualMemoryManager.PageAlign(address + size) - start);
         }
         return status;
     }
@@ -67,7 +69,9 @@ public static class MemoryApis
         if (NtStatus.IsSuccess(status))
         {
             if (oldPtr != 0) ctx.Memory.Write(oldPtr, (uint)old);
-            ctx.Memory.Write(sizePtr, VirtualMemoryManager.PageAlign(size));
+            var start = address & ~(VirtualMemoryManager.PageSize - 1);
+            ctx.Memory.Write(basePtr, start);
+            ctx.Memory.Write(sizePtr, VirtualMemoryManager.PageAlign(address + size) - start);
         }
         return status;
     }
@@ -83,6 +87,7 @@ public static class MemoryApis
         var returnLengthPtr = ctx.Arg(5);
         var query = ctx.Process.Memory.Query(address);
         if (query is null) return NtStatus.InvalidAddress;
+        if (infoPtr == 0) return NtStatus.AccessViolation;
         if (infoClass == 0)
         {
             const int size = 48;
@@ -91,7 +96,7 @@ public static class MemoryApis
             {
                 ctx.Memory.Write(infoPtr, query.BaseAddress);
                 ctx.Memory.Write(infoPtr + 8, query.AllocationBase);
-                ctx.Memory.Write(infoPtr + 16, (uint)query.Protection);
+                ctx.Memory.Write(infoPtr + 16, (uint)query.AllocationProtection);
                 ctx.Memory.Write(infoPtr + 20, (ushort)0);
                 ctx.Memory.Write(infoPtr + 22, (ushort)0);
                 ctx.Memory.Write(infoPtr + 24, query.RegionSize);
@@ -104,41 +109,38 @@ public static class MemoryApis
             return NtStatus.Success;
         }
         if (infoClass == 2)
-        {
-            // MEMORY_SECTION_NAME: UNICODE_STRING (16 bytes on x64) followed by the name.
-            var name = query.Label ?? string.Empty;
-            var bytes = System.Text.Encoding.Unicode.GetBytes(name);
-            var required = 16 + bytes.Length + 2;
-            if (infoLength < (ulong)required) return NtStatus.BufferTooSmall;
-            if (infoPtr != 0)
-            {
-                ctx.Memory.Write(infoPtr, (ushort)(bytes.Length + 2));
-                ctx.Memory.Write(infoPtr + 2, (ushort)(bytes.Length + 2));
-                ctx.Memory.Write(infoPtr + 4, 0u);
-                ctx.Memory.Write(infoPtr + 8, infoPtr + 16);
-                ctx.Memory.WriteBytes(infoPtr + 16, bytes);
-                ctx.Memory.Write(infoPtr + 16 + (ulong)bytes.Length, (ushort)0);
-            }
-            if (returnLengthPtr != 0) ctx.Memory.Write(returnLengthPtr, (ulong)required);
-            return NtStatus.Success;
-        }
+            return HostQueryMemory(new IntPtr(-1), (IntPtr)(long)address, infoClass,
+                (IntPtr)(long)infoPtr, (nuint)infoLength, (IntPtr)(long)returnLengthPtr);
         return NtStatus.InvalidInfoClass;
     }
 
     [VirtualApi("ntdll.dll", "NtLockVirtualMemory", ApiCategory.Memory)]
-    private static ulong NtLockVirtualMemory(ApiCallContext ctx) => NtStatus.Success;
+    private static ulong NtLockVirtualMemory(ApiCallContext ctx) => LockNt(ctx, true);
 
     [VirtualApi("ntdll.dll", "NtUnlockVirtualMemory", ApiCategory.Memory)]
-    private static ulong NtUnlockVirtualMemory(ApiCallContext ctx) => NtStatus.Success;
+    private static ulong NtUnlockVirtualMemory(ApiCallContext ctx) => LockNt(ctx, false);
 
     // --- kernel32 wrappers ---------------------------------------------------------
-    [VirtualApi("kernel32.dll", "VirtualAlloc", ApiCategory.Memory)]
-    private static ulong VirtualAlloc(ApiCallContext ctx)
+    [VirtualApi("kernel32.dll", "VirtualAlloc", ApiCategory.Memory, "kernelbase!VirtualAlloc")]
+    private static ulong VirtualAlloc(ApiCallContext ctx) => VirtualAllocCore(ctx, 0);
+
+    [VirtualApi("kernel32.dll", "VirtualAllocEx", ApiCategory.Memory, "kernelbase!VirtualAllocEx")]
+    private static ulong VirtualAllocEx(ApiCallContext ctx)
     {
-        var requestedBase = ctx.Arg(0);
-        var size = ctx.Arg(1);
-        var type = (AllocationType)ctx.Arg32(2);
-        var protection = (MemoryProtection)ctx.Arg32(3);
+        if (!IsCurrentProcessHandle(ctx, ctx.Arg(0)))
+        {
+            ctx.SetLastError(Win32Error.InvalidHandle);
+            return 0;
+        }
+        return VirtualAllocCore(ctx, 1);
+    }
+
+    private static ulong VirtualAllocCore(ApiCallContext ctx, int offset)
+    {
+        var requestedBase = ctx.Arg(offset);
+        var size = ctx.Arg(offset + 1);
+        var type = (AllocationType)ctx.Arg32(offset + 2);
+        var protection = (MemoryProtection)ctx.Arg32(offset + 3);
         var status = ctx.Process.Memory.TryAllocate(requestedBase, size, protection, type,
             out var actualBase, out _, "VirtualAlloc");
         if (!NtStatus.IsSuccess(status))
@@ -149,36 +151,80 @@ public static class MemoryApis
         return actualBase;
     }
 
-    [VirtualApi("kernel32.dll", "VirtualFree", ApiCategory.Memory)]
-    private static ulong VirtualFree(ApiCallContext ctx)
+    [VirtualApi("kernel32.dll", "VirtualFree", ApiCategory.Memory, "kernelbase!VirtualFree")]
+    private static ulong VirtualFree(ApiCallContext ctx) => VirtualFreeCore(ctx, 0);
+
+    [VirtualApi("kernel32.dll", "VirtualFreeEx", ApiCategory.Memory, "kernelbase!VirtualFreeEx")]
+    private static ulong VirtualFreeEx(ApiCallContext ctx)
     {
-        var status = ctx.Process.Memory.TryFree(ctx.Arg(0), ctx.Arg(1), (FreeType)ctx.Arg32(2));
+        if (!IsCurrentProcessHandle(ctx, ctx.Arg(0)))
+        {
+            ctx.SetLastError(Win32Error.InvalidHandle);
+            return 0;
+        }
+        return VirtualFreeCore(ctx, 1);
+    }
+
+    private static ulong VirtualFreeCore(ApiCallContext ctx, int offset)
+    {
+        var status = ctx.Process.Memory.TryFree(ctx.Arg(offset), ctx.Arg(offset + 1), (FreeType)ctx.Arg32(offset + 2));
         return BoolResult(ctx, NtStatus.IsSuccess(status), Win32FromStatus(status));
     }
 
-    [VirtualApi("kernel32.dll", "VirtualProtect", ApiCategory.Memory)]
-    private static ulong VirtualProtect(ApiCallContext ctx)
+    [VirtualApi("kernel32.dll", "VirtualProtect", ApiCategory.Memory, "kernelbase!VirtualProtect")]
+    private static ulong VirtualProtect(ApiCallContext ctx) => VirtualProtectCore(ctx, 0);
+
+    [VirtualApi("kernel32.dll", "VirtualProtectEx", ApiCategory.Memory, "kernelbase!VirtualProtectEx")]
+    private static ulong VirtualProtectEx(ApiCallContext ctx)
     {
-        var status = ctx.Process.Memory.TryProtect(ctx.Arg(0), ctx.Arg(1), (MemoryProtection)ctx.Arg32(2), out var old);
-        if (NtStatus.IsSuccess(status) && ctx.Arg(3) != 0) ctx.Memory.Write(ctx.Arg(3), (uint)old);
+        if (!IsCurrentProcessHandle(ctx, ctx.Arg(0)))
+        {
+            ctx.SetLastError(Win32Error.InvalidHandle);
+            return 0;
+        }
+        return VirtualProtectCore(ctx, 1);
+    }
+
+    private static ulong VirtualProtectCore(ApiCallContext ctx, int offset)
+    {
+        var status = ctx.Process.Memory.TryProtect(ctx.Arg(offset), ctx.Arg(offset + 1), (MemoryProtection)ctx.Arg32(offset + 2), out var old);
+        if (NtStatus.IsSuccess(status) && ctx.Arg(offset + 3) != 0) ctx.Memory.Write(ctx.Arg(offset + 3), (uint)old);
         return BoolResult(ctx, NtStatus.IsSuccess(status), Win32FromStatus(status));
     }
 
-    [VirtualApi("kernel32.dll", "VirtualQuery", ApiCategory.Memory)]
-    private static ulong VirtualQuery(ApiCallContext ctx)
+    [VirtualApi("kernel32.dll", "VirtualQuery", ApiCategory.Memory, "kernelbase!VirtualQuery")]
+    private static ulong VirtualQuery(ApiCallContext ctx) => VirtualQueryCore(ctx, 0);
+
+    [VirtualApi("kernel32.dll", "VirtualQueryEx", ApiCategory.Memory, "kernelbase!VirtualQueryEx")]
+    private static ulong VirtualQueryEx(ApiCallContext ctx)
     {
-        var query = ctx.Process.Memory.Query(ctx.Arg(0));
+        if (!IsCurrentProcessHandle(ctx, ctx.Arg(0)))
+        {
+            ctx.SetLastError(Win32Error.InvalidHandle);
+            return 0;
+        }
+        return VirtualQueryCore(ctx, 1);
+    }
+
+    private static ulong VirtualQueryCore(ApiCallContext ctx, int offset)
+    {
+        var query = ctx.Process.Memory.Query(ctx.Arg(offset));
         if (query is null)
         {
             ctx.SetLastError(487);
             return 0;
         }
-        var infoPtr = ctx.Arg(1);
+        var infoPtr = ctx.Arg(offset + 1);
         const ulong size = 48;
-        if (infoPtr == 0 || ctx.Arg(2) < size) return 0;
+        if (infoPtr == 0 || ctx.Arg(offset + 2) < size)
+        {
+            ctx.SetLastError(Win32Error.InvalidParameter);
+            return 0;
+        }
+        ctx.Memory.WriteBytes(infoPtr, new byte[48]);
         ctx.Memory.Write(infoPtr, query.BaseAddress);
         ctx.Memory.Write(infoPtr + 8, query.AllocationBase);
-        ctx.Memory.Write(infoPtr + 16, (uint)query.Protection);
+        ctx.Memory.Write(infoPtr + 16, (uint)query.AllocationProtection);
         ctx.Memory.Write(infoPtr + 24, query.RegionSize);
         ctx.Memory.Write(infoPtr + 32, (uint)query.State);
         ctx.Memory.Write(infoPtr + 36, (uint)query.Protection);
@@ -186,14 +232,47 @@ public static class MemoryApis
         return size;
     }
 
-    [VirtualApi("kernel32.dll", "VirtualLock", ApiCategory.Memory)]
-    private static ulong VirtualLock(ApiCallContext ctx) => 1;
+    [VirtualApi("kernel32.dll", "VirtualLock", ApiCategory.Memory, "kernelbase!VirtualLock")]
+    private static ulong VirtualLock(ApiCallContext ctx) =>
+        BoolResult(ctx, HostLock((IntPtr)(long)ctx.Arg(0), (nuint)ctx.Arg(1)), System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
-    [VirtualApi("kernel32.dll", "VirtualUnlock", ApiCategory.Memory)]
-    private static ulong VirtualUnlock(ApiCallContext ctx) => 1;
+    [VirtualApi("kernel32.dll", "VirtualUnlock", ApiCategory.Memory, "kernelbase!VirtualUnlock")]
+    private static ulong VirtualUnlock(ApiCallContext ctx) =>
+        BoolResult(ctx, HostUnlock((IntPtr)(long)ctx.Arg(0), (nuint)ctx.Arg(1)), System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
-    [VirtualApi("kernel32.dll", "GetLargePageMinimum", ApiCategory.Memory)]
-    private static ulong GetLargePageMinimum(ApiCallContext ctx) => 0x20_0000;
+    [VirtualApi("kernel32.dll", "GetLargePageMinimum", ApiCategory.Memory, "kernelbase!GetLargePageMinimum")]
+    private static ulong GetLargePageMinimum(ApiCallContext ctx) => (ulong)HostLargePageMinimum();
+
+    private static ulong LockNt(ApiCallContext ctx, bool locked)
+    {
+        if (!IsCurrentProcessHandle(ctx, ctx.Arg(0))) return NtStatus.InvalidHandle;
+        if (ctx.Arg(1) == 0 || ctx.Arg(2) == 0 || ctx.Arg32(3) != 1) return NtStatus.InvalidParameter;
+        var address = ctx.Read<ulong>(ctx.Arg(1));
+        var size = ctx.Read<ulong>(ctx.Arg(2));
+        if (size == 0 || size > ulong.MaxValue - VirtualMemoryManager.PageSize ||
+            address > ulong.MaxValue - size - VirtualMemoryManager.PageSize) return NtStatus.InvalidParameter;
+        var start = address & ~(VirtualMemoryManager.PageSize - 1);
+        var length = VirtualMemoryManager.PageAlign(address + size) - start;
+        var ok = locked ? HostLock((IntPtr)(long)start, (nuint)length) : HostUnlock((IntPtr)(long)start, (nuint)length);
+        if (!ok) return NtStatus.FromWin32(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+        ctx.Write(ctx.Arg(1), start);
+        ctx.Write(ctx.Arg(2), length);
+        return NtStatus.Success;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "VirtualLock", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool HostLock(IntPtr address, nuint size);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "VirtualUnlock", SetLastError = true)]
+    [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+    private static extern bool HostUnlock(IntPtr address, nuint size);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", EntryPoint = "GetLargePageMinimum")]
+    private static extern nuint HostLargePageMinimum();
+
+    [System.Runtime.InteropServices.DllImport("ntdll.dll", EntryPoint = "NtQueryVirtualMemory")]
+    private static extern uint HostQueryMemory(IntPtr process, IntPtr address, uint infoClass, IntPtr buffer, nuint length, IntPtr returned);
 
     // --- CRT-style memory helpers --------------------------------------------------
     [VirtualApi("ntdll.dll", "RtlZeroMemory", ApiCategory.Memory)]

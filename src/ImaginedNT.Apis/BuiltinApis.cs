@@ -10,6 +10,7 @@ public static class BuiltinApis
     public static IReadOnlyList<Assembly> Assemblies { get; } = Array.AsReadOnly(new[]
     {
         typeof(BuiltinApis).Assembly,
+        typeof(ImaginedNT.Apis.Com.ComApis).Assembly,
         typeof(ImaginedNT.Apis.Crt.CrtStringApis).Assembly,
         typeof(SystemApis).Assembly,
         typeof(PackageApis).Assembly,
@@ -54,6 +55,8 @@ public static class BuiltinApis
             ExecutionTimeoutMilliseconds = o.ExecutionTimeout.TotalMilliseconds,
             o.LimitJobObject,
             o.JobMemoryLimitBytes,
+            o.MaximumPhysicalMemoryBytes,
+            o.MaximumVirtualMemoryBytes,
             o.JobActiveProcessLimit,
             o.AllowNativeForwarding,
             o.AllowFileWrites,

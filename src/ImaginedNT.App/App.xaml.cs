@@ -35,7 +35,11 @@ public sealed partial class App : Application
         var deferral = args.SuspendingOperation.GetDeferral();
         try
         {
-            if (_page is not null) await _page.StopShellAsync();
+            if (_page is not null)
+            {
+                await _page.StopDesktopAsync();
+                await _page.StopShellAsync();
+            }
         }
         finally
         {

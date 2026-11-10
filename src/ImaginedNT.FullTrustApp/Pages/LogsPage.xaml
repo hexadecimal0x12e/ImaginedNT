@@ -1,0 +1,6 @@
+<Page
+    x:Class="ImaginedNT.FullTrustApp.Pages.LogsPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <ListView x:Name="LogList" FontFamily="Consolas" SelectionMode="None" ScrollViewer.HorizontalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollMode="Enabled" />
+</Page>

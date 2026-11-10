@@ -12,13 +12,16 @@ internal static class Program
 {
     private static int Main(string[] args)
     {
-        var filter = args.FirstOrDefault(a => !a.StartsWith('-'));
+        var filters = args.Where(a => !a.StartsWith('-'))
+            .SelectMany(a => a.Split(['|', ','], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            .ToArray();
         var tests = new List<(string Name, Action Body)>();
         PeTests.Register(tests);
         MemoryTests.Register(tests);
         ObjectFileTests.Register(tests);
         ManagedApiTests.Register(tests);
         PartiallyImaginedTests.Register(tests);
+        ComTests.Register(tests);
         NativeApiDeclarationTests.Register(tests);
         MethodTraceTests.Register(tests);
         LoaderTests.Register(tests);
@@ -33,7 +36,8 @@ internal static class Program
 
         foreach (var (name, body) in tests)
         {
-            if (filter is not null && !name.Contains(filter, StringComparison.OrdinalIgnoreCase)) continue;
+            if (filters.Length > 0 && !filters.Any(filter => name.Contains(filter, StringComparison.OrdinalIgnoreCase)))
+                continue;
             try
             {
                 body();

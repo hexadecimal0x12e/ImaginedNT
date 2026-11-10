@@ -11,14 +11,17 @@ custom entry point and avoiding CRT startup.
 | `hello.exe` | `GetStdHandle`, `WriteFile`, `ExitProcess` | managed console write through the IAT | 42 |
 | `threads.exe` | `CreateThread`, `WaitForSingleObject`, `GetExitCodeThread`, `CloseHandle`, `ExitProcess` | guest thread creation, wait and exit code | 55 |
 | `fileio.exe` | `CreateFileW`, `WriteFile`, `ReadFile`, `CloseHandle`, `ExitProcess` | sandboxed file create/read/write | 66 |
-| `memory.exe` | `GetSystemInfo`, `VirtualAlloc`, `VirtualProtect`, `VirtualQuery`, `VirtualFree`, `ExitProcess` | managed virtual memory | 77 |
+| `memory.exe` | `GetSystemInfo`, `VirtualAlloc`, `VirtualProtect`, `VirtualQuery`, `VirtualFree`, `GlobalMemoryStatusEx`, `GetProcessMemoryInfo`, `NtQueryInformationProcess`, `ExitProcess` | virtual memory; process and environment memory reports before allocation, after allocation and after release | 77 |
 | `native.exe` | `GetACP`, `OpenProcess`, `GetLastError`, `CreateFileW`, `ExitProcess` | native forwarding + last-error bridging between native and managed calls | 89 |
 | `reloc.exe` | `ExitProcess` | base relocation at a forced load address | 99 |
 | `syscall.exe` | `ExitProcess` | direct `syscall` instruction trapped by the VEH | 42 |
 | `dllhost.exe` + `helper.dll` | `LoadLibraryW`, `GetProcAddress`, `GetModuleHandleW`, `ExitProcess` | managed guest DLL mapping, `DllMain`, export lookup | 70 |
 | `directsyscall.exe` | `CreateEventW`, `GetModuleHandleW`, `GetProcAddress`, `CloseHandle`, `ExitProcess` | reads the real `NtClose` syscall number from ntdll, executes `syscall` in guest code, expects managed `NtClose` to close the handle | 80 |
 | `spawn.exe` + `child.exe` | `CreateProcessW`, `ResumeThread`, `WaitForSingleObject`, `GetExitCodeProcess`, `CloseHandle`, `ExitProcess` | creates a `CREATE_SUSPENDED` child process, resumes it, waits for it and checks its exit code; both run on separate C# managed threads in one host | 101 |
+| `comtest.exe` | `CoInitializeEx`, `CoCreateInstance`, `CoUninitialize`, `SysFreeString` (by ordinal), `ExitProcess` | real COM ABI against the built-in managed COM class: vtable calls, out parameters, BSTR, `QueryInterface`/`AddRef`/`Release` | 42 |
+| `comserver.dll` | `SysAllocString` | CRT-free in-process COM server exporting `DllGetClassObject`/`DllCanUnloadNow`; used by the COM tests through `CoGetClassObject` | n/a |
 | `shell.exe` | `GetStdHandle`, `ReadFile`, `WriteFile`, `CreateFileW`, `FindFirstFileW`, `FindNextFileW`, `FindClose`, `CreateDirectoryW`, `RemoveDirectoryW`, `DeleteFileW`, `MoveFileExW`, `Get/SetCurrentDirectoryW`, `CreateProcessW`, waits/exit codes | minimal cmd.exe-style guest shell: `dir`, `cd`, `pwd`, `type`, `echo`, `mkdir`, `rmdir`, `del`, `copy`, `move`, `run`, `cls`, `exit` | 0 on `exit` |
+| `window.exe` | `RegisterClassExW`, `CreateWindowExW`, `ShowWindow`, `UpdateWindow`, `GetMessageW`, `TranslateMessage`, `DispatchMessageW`, `DefWindowProcW`, `SetWindowTextW`, `DestroyWindow`, `PostQuitMessage` | two guest top-level windows plus `STATIC`/`BUTTON` child controls; the App's XAML DWM compositor renders them and forwards mouse/keyboard messages. No GDI. | 0 on close |
 | `spin.exe` | `GetTickCount64` | infinite CPU-bound loop; demonstrates the host watchdog and `--timeout` termination | 124 (host timeout, never exits by itself) |
 | `failfast.exe` + `failfastdll.dll` | process/thread APIs, `RaiseFailFastException`, `FatalAppExitA/W`, fatal CRT imports, dynamic NT exports | 21 fatal-exit cases in virtual children; checks exit codes, thread completion and parent survival | 0 if all selected cases pass |
 
@@ -52,6 +55,9 @@ dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin
 # Deny child creation instead:
 dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin/spawn.exe --strict --no-process --verbose
 
+# Managed COM: the guest creates ImaginedNT's built-in COM class and calls its vtable
+dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin/comtest.exe --strict --verbose
+
 # CPU spinner: never returns; the watchdog kills it after two seconds
 dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin/spin.exe --strict --timeout 2 --verbose
 
@@ -60,6 +66,10 @@ dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin
 dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin/shell.exe --strict --sandbox sandbox\shell -- /c "dir"
 "dir`nrun hello.exe`nexit" | dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin/shell.exe --strict --sandbox sandbox\shell
 ```
+
+`window.exe` needs the App's USER32/DWM implementation, which lives in `src/ImaginedNT.App/Gui`
+(not in the Host API set).  Build it, then run it from the App's `窗口桌面` page; running it
+through `ImaginedNT.Host` will still create the window state but there is no compositor to show it.
 
 Without `-- /c` and without piped input the shell waits for a command on stdin.  The CLI has no
 default timeout, so the shell stays alive until you type `exit`, close stdin, or pass

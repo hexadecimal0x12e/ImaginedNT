@@ -6,8 +6,7 @@ using ImaginedNT.Core.Io;
 
 namespace ImaginedNT.App;
 
-internal sealed class ShellSession(string sandboxRoot,
-    IReadOnlyDictionary<char, string> drives, TraceLog log) : IAsyncDisposable
+internal sealed class ShellSession(RuntimeOptions options, TraceLog log) : IAsyncDisposable
 {
     private readonly TerminalInput _input = new();
     private readonly TerminalOutput _output = new();
@@ -26,25 +25,16 @@ internal sealed class ShellSession(string sandboxRoot,
             if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
                 throw new PlatformNotSupportedException("ImaginedNT 运行时需要 x64，请使用 x64 配置启动。");
 
+            var sandboxRoot = options.SandboxRoot!;
             var shell = Path.Combine(sandboxRoot, "shell.exec");
             //if (!HostFileSystem.FileExists(shell))
             //    throw new FileNotFoundException("未找到 shell.exe，请先生成原生示例并将其包含在应用包中。", shell);
 
             shell = Path.Combine(sandboxRoot, "shell.exec");
-            var runtime = BuiltinApis.CreateRuntime(new RuntimeOptions
-            {
-                SandboxRoot = sandboxRoot,
-                Drives = drives.ToDictionary(d => d.Key, d => new VirtualDriveOptions(d.Value)),
-                StandardInput = _input,
-                StandardOutput = _output,
-                StandardError = _output,
-                DiagnosticWriter = null,
-                TerminationMode = ProcessTerminationMode.ThreadExit,
-                ImportPolicy = ImportPolicy.ManagedFirst,
-                AllowNativeForwarding = true,
-                FailOnUnresolvedImport = false,
-                ExecutionTimeout = Timeout.InfiniteTimeSpan
-            });
+            options.StandardInput = _input;
+            options.StandardOutput = _output;
+            options.StandardError = _output;
+            var runtime = BuiltinApis.CreateRuntime(options);
             Volatile.Write(ref _runtime, runtime);
             var process = runtime.CreateProcess(shell, "\"C:\\shell.exe\"", "C:\\");
             try

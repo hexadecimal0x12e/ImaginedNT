@@ -31,7 +31,7 @@ public sealed class SandboxFileSystem
         foreach (var pair in mappings.OrderBy(p => p.Key))
         {
             var drive = new VirtualDrive(pair.Key, pair.Value);
-            HostFileSystem.CreateDirectory(drive.HostDirectory);
+            if (drive.MapTable is null) HostFileSystem.CreateDirectory(drive.HostDirectory);
             _drives.Add(pair.Key, drive);
             _trace?.Emit(TraceKind.Security, $"file sandbox {pair.Key}: -> {drive.HostDirectory} writes={allowWrites}", pid);
         }
@@ -92,7 +92,52 @@ public sealed class SandboxFileSystem
         return (drive, host);
     }
 
-    public string MapPath(string ntPath, string currentDirectory = "\\") => ResolvePath(ntPath, currentDirectory).Path;
+    public string MapPath(string ntPath, string currentDirectory = "\\", FileOperation operation = FileOperation.Read) =>
+        ResolveAccess(ntPath, currentDirectory, operation).Path;
+
+    public string MapImagePath(string host)
+    {
+        host = Path.GetFullPath(host);
+        foreach (var drive in _drives.Values)
+        {
+            var relative = Path.GetRelativePath(drive.HostDirectory, host);
+            if (relative == ".." || relative.StartsWith("..\\") || Path.IsPathRooted(relative)) continue;
+            var guest = drive.RootPath + (relative == "." ? "" : relative);
+            _ = MapPath(guest, drive.RootPath, FileOperation.Execute);
+            return MapPath(guest, drive.RootPath, FileOperation.Read);
+        }
+        return host;
+    }
+
+    public bool HasMapTables => _drives.Values.Any(d => d.MapTable is not null);
+
+    public (string Path, bool Discard) ResolveAccess(string path, string current, FileOperation operation, int depth = 0)
+    {
+        if (depth > 32) throw new NtFileException(NtStatus.AccessDenied, "cyclic file remapping");
+        var resolved = ResolvePath(path, current);
+        var table = resolved.Drive.MapTable;
+        FileRule? rule = null;
+        var suffix = "";
+        if (table is not null)
+        {
+            var relative = Path.GetRelativePath(resolved.Drive.HostDirectory, resolved.Path);
+            (rule, suffix) = table.Resolve(relative == "." ? "" : relative, operation, out var excluded);
+            if (excluded) throw new NtFileException(NtStatus.ObjectNameNotFound, $"path excluded: {path}");
+        }
+        if ((operation is FileOperation.Write or FileOperation.Delete) && (!AllowWrites || table?.Readonly == true))
+            throw new NtFileException(NtStatus.AccessDenied, "volume is read-only");
+        if (rule is null) return (resolved.Path, false);
+        if (!rule.Allowed)
+        {
+            _trace?.Emit(TraceKind.Security, $"denied {operation}: {path}", _pid);
+            throw new NtFileException(NtStatus.AccessDenied, $"{operation} denied: {path}");
+        }
+        if (rule.Discard) return (resolved.Path, true);
+        if (rule.Target is null) return (resolved.Path, false);
+        var target = suffix.Length == 0 ? rule.Target : rule.Target.TrimEnd('\\', '/') + "\\" + suffix;
+        if (rule.Virtual) return ResolveAccess(target, resolved.Drive.RootPath, operation, depth + 1);
+        return (Path.GetFullPath(target), false);
+    }
 
     public VirtualDrive GetDrive(string path, string currentDirectory = "\\") => ResolvePath(path, currentDirectory).Drive;
 
@@ -107,12 +152,21 @@ public sealed class SandboxFileSystem
         CreateOptions options, string currentDirectory = "\\")
     {
         ntPath = GetFullPath(ntPath, currentDirectory);
-        var hostPath = MapPath(ntPath, currentDirectory);
+        var hostPath = ResolvePath(ntPath, currentDirectory).Path;
         var isDirectoryRequest = (options & CreateOptions.DirectoryFile) != 0;
         var existingDirectory = HostFileSystem.DirectoryExists(hostPath);
         var existingFile = HostFileSystem.FileExists(hostPath);
         var wantsWrite = (desiredAccess & (NtAccess.FileWriteData | NtAccess.FileAppendData | NtAccess.GenericWrite | NtAccess.GenericAll)) != 0;
         var wantsRead = (desiredAccess & (NtAccess.FileReadData | NtAccess.FileExecute | NtAccess.GenericRead | NtAccess.GenericExecute | NtAccess.GenericAll)) != 0;
+
+        if (GetDrive(ntPath, currentDirectory).MapTable is not null)
+        {
+            try { return OpenMapped(ntPath, desiredAccess, share, disposition, options, currentDirectory, wantsRead, wantsWrite); }
+            catch (UnauthorizedAccessException ex) { throw new NtFileException(NtStatus.AccessDenied, ex.Message); }
+            catch (DirectoryNotFoundException ex) { throw new NtFileException(NtStatus.ObjectPathNotFound, ex.Message); }
+            catch (FileNotFoundException ex) { throw new NtFileException(NtStatus.ObjectNameNotFound, ex.Message); }
+            catch (IOException ex) { throw new NtFileException(NtStatus.SharingViolation, ex.Message); }
+        }
 
         if (wantsWrite && !AllowWrites)
             throw new NtFileException(NtStatus.AccessDenied, "the sandbox is read-only");
@@ -188,6 +242,79 @@ public sealed class SandboxFileSystem
         }
     }
 
+    private FileObject OpenMapped(string path, uint access, ShareAccess share, CreateDisposition disposition,
+        CreateOptions options, string current, bool read, bool write)
+    {
+        write |= disposition != CreateDisposition.Open;
+        if ((access & (NtAccess.FileExecute | NtAccess.GenericExecute)) != 0) _ = MapPath(path, current, FileOperation.Execute);
+        var r = read || !write ? ResolveAccess(path, current, FileOperation.Read) : default;
+        var w = write ? ResolveAccess(path, current, FileOperation.Write) : default;
+        var host = read || !write ? r.Path : w.Path;
+        if ((options & CreateOptions.DirectoryFile) != 0 || HostFileSystem.DirectoryExists(host))
+        {
+            _ = MapPath(path, current, FileOperation.Enum);
+            if ((options & CreateOptions.NonDirectoryFile) != 0) throw new NtFileException(NtStatus.FileIsADirectory, path);
+            if (write && !w.Discard && disposition != CreateDisposition.Open) HostFileSystem.CreateDirectory(w.Path);
+            if (!HostFileSystem.DirectoryExists(host) && !(write && w.Discard)) throw new NtFileException(NtStatus.ObjectPathNotFound, path);
+            return new DirectoryFileObject(host, path);
+        }
+        var mode = disposition switch
+        {
+            CreateDisposition.Create => FileMode.CreateNew,
+            CreateDisposition.Supersede or CreateDisposition.OverwriteIf => FileMode.Create,
+            CreateDisposition.Overwrite => FileMode.Truncate,
+            CreateDisposition.OpenIf => FileMode.OpenOrCreate,
+            _ => FileMode.Open
+        };
+        var sharing = (FileShare)((uint)share & 7);
+        FileStream? rs = null, ws = null;
+        try
+        {
+            if (write && !w.Discard && read && string.Equals(r.Path, w.Path, StringComparison.OrdinalIgnoreCase))
+                rs = ws = HostFileSystem.Open(w.Path, mode, FileAccess.ReadWrite, sharing);
+            else
+            {
+                if (read || !write) rs = HostFileSystem.Open(r.Path, FileMode.Open, FileAccess.Read, sharing);
+                if (write && !w.Discard) ws = HostFileSystem.Open(w.Path, mode, FileAccess.Write, sharing);
+            }
+            return new MappedFileObject(path, rs, ws, write && w.Discard, () => Delete(path, current));
+        }
+        catch { rs?.Dispose(); if (!ReferenceEquals(rs, ws)) ws?.Dispose(); throw; }
+    }
+
+    public IEnumerable<HostFileInfo> Enumerate(string path, string current)
+    {
+        var host = MapPath(path, current, FileOperation.Enum);
+        var resolved = ResolvePath(path, current);
+        var relative = Path.GetRelativePath(resolved.Drive.HostDirectory, resolved.Path);
+        var names = (HostFileSystem.DirectoryExists(host) ? HostFileSystem.EnumerateInfos(host).Select(i => i.Name) : Enumerable.Empty<string>())
+            .Concat(resolved.Drive.MapTable?.Children(relative == "." ? "" : relative) ?? []).Distinct(StringComparer.OrdinalIgnoreCase);
+        foreach (var name in names)
+        {
+            HostFileInfo? info = null;
+            try
+            {
+                var guest = GetFullPath(path, current).TrimEnd('\\') + "\\" + name;
+                _ = MapPath(guest, current, FileOperation.Enum);
+                var target = MapPath(guest, current);
+                if (HostFileSystem.FileExists(target) || HostFileSystem.DirectoryExists(target)) info = HostFileSystem.GetInfo(target) with { FullName = Path.Combine(host, name) };
+                else if (resolved.Drive.MapTable?.Children(relative == "." ? name : relative + "\\" + name).Any() == true)
+                    info = new(Path.Combine(host, name), FileAttributes.Directory, 0, DateTime.UnixEpoch, DateTime.UnixEpoch, DateTime.UnixEpoch);
+            }
+            catch (NtFileException) { }
+            if (info is not null) yield return info;
+        }
+    }
+
+    public string MapNativePath(string path, string current, bool read, bool write)
+    {
+        var r = read ? ResolveAccess(path, current, FileOperation.Read) : default;
+        var w = write ? ResolveAccess(path, current, FileOperation.Write) : default;
+        if (w.Discard || (read && write && !string.Equals(r.Path, w.Path, StringComparison.OrdinalIgnoreCase)))
+            throw new NtFileException(NtStatus.InvalidDeviceRequest, "native CRT handles cannot represent split or discarded I/O");
+        return write ? w.Path : r.Path;
+    }
+
     public bool Exists(string ntPath, string currentDirectory = "\\")
     {
         try { return HostFileSystem.FileExists(MapPath(ntPath, currentDirectory)); }
@@ -197,7 +324,8 @@ public sealed class SandboxFileSystem
     public void Delete(string ntPath, string currentDirectory = "\\")
     {
         if (!AllowWrites) throw new NtFileException(NtStatus.AccessDenied, "the sandbox is read-only");
-        var host = MapPath(ntPath, currentDirectory);
+        _ = MapPath(ntPath, currentDirectory, FileOperation.Delete);
+        var host = MapPath(ntPath, currentDirectory, FileOperation.Write);
         if (HostFileSystem.DirectoryExists(host)) HostFileSystem.DeleteDirectory(host);
         else if (HostFileSystem.FileExists(host)) HostFileSystem.DeleteFile(host);
         else throw new NtFileException(NtStatus.ObjectNameNotFound, ntPath);

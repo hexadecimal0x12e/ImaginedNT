@@ -23,6 +23,7 @@ public static class NtStatus
     public const uint AccessViolation = 0xC0000005;
     public const uint InPageError = 0xC0000006;
     public const uint InvalidHandle = 0xC0000008;
+    public const uint InvalidCid = 0xC000000B;
     public const uint InvalidParameter = 0xC000000D;
     public const uint NoMemory = 0xC0000017;
     public const uint AlreadyCommitted = 0xC0000018;
@@ -73,6 +74,7 @@ public static class NtStatus
     public const uint MediaWriteProtected = 0xC00000A2;
     public const uint SharingViolation = 0xC0000043;
     public const uint PipeNotConnected = 0xC00000B0;
+    public const uint PipeBroken = 0xC000014B;
     public const uint IoTimeout = 0xC00000B5;
     public const uint OperationAborted = 0xC0000244;
     public const uint WorkingSetLimitExceeded = 0xC0000041;
@@ -91,6 +93,7 @@ public static class NtStatus
         Pending => "STATUS_PENDING",
         NotImplemented => "STATUS_NOT_IMPLEMENTED",
         InvalidHandle => "STATUS_INVALID_HANDLE",
+        PipeBroken => "STATUS_PIPE_BROKEN",
         InvalidParameter => "STATUS_INVALID_PARAMETER",
         AccessDenied => "STATUS_ACCESS_DENIED",
         NoMemory => "STATUS_NO_MEMORY",
@@ -130,11 +133,15 @@ public static class NtStatus
         38 => EndOfFile,
         80 or 183 => ObjectNameCollision,
         87 => InvalidParameter,
+        109 => PipeBroken,
         123 => ObjectNameInvalid,
         145 => DirectoryNotEmpty,
         206 => ObjectNameTooLong,
         267 => NotADirectory,
+        487 => InvalidAddress,
         998 => AccessViolation,
+        1453 => WorkingSetLimitExceeded,
+        1455 => NoMemory,
         _ => 0xC0000000u | (uint)error
     };
 }

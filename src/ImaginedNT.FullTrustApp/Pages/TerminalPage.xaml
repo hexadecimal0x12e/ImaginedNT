@@ -1,0 +1,40 @@
+<Page
+    x:Class="ImaginedNT.FullTrustApp.Pages.TerminalPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Loaded="OnLoaded"
+    Unloaded="OnUnloaded">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+        <Grid ColumnSpacing="8" Margin="0,0,0,8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="ImageInput" Header="第一个用户态进程（主机完整路径或沙盒相对路径）" />
+            <TextBox x:Name="ArgumentsInput" Grid.Column="1" Header="启动参数" />
+        </Grid>
+        <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" Margin="0,0,0,12">
+            <Button x:Name="StartButton" Content="启动" Click="OnStartClicked" />
+            <Button x:Name="WindowButton" Content="启动 GDI 示例" Click="OnWindowClicked" />
+            <Button x:Name="StopButton" Content="停止" IsEnabled="False" Click="OnStopClicked" />
+            <Button Content="清屏" Click="OnClearClicked" />
+        </StackPanel>
+        <ScrollViewer x:Name="TerminalScroll" Grid.Row="2" Background="#11151B" Padding="12">
+            <TextBlock x:Name="TerminalText" FontFamily="Consolas" Foreground="#D8DFE8" IsTextSelectionEnabled="True" TextWrapping="Wrap" />
+        </ScrollViewer>
+        <Grid Grid.Row="3" Margin="0,12,0,0" ColumnSpacing="8">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <TextBox x:Name="CommandInput" PlaceholderText="终端输入" IsEnabled="False" KeyDown="OnCommandKeyDown" />
+            <Button x:Name="SendButton" Grid.Column="1" Content="发送" IsEnabled="False" Click="OnSendClicked" />
+        </Grid>
+    </Grid>
+</Page>

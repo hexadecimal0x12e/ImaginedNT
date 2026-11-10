@@ -2,6 +2,7 @@
     x:Class="ImaginedNT.App.MainPage"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="using:ImaginedNT.App.Controls"
     Loaded="OnLoaded"
     Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
     RequiresPointer="WhenFocused">
@@ -13,8 +14,10 @@
             <NavigationViewItem Content="进程" Tag="processes" Icon="AllApps" />
             <NavigationViewItem Content="虚拟文件系统" Tag="files" Icon="Folder" />
             <NavigationViewItem Content="注册表" Tag="registry" Icon="Library" />
+            <NavigationViewItem Content="窗口桌面" Tag="desktop" Icon="View" />
             <NavigationViewItem Content="运行日志" Tag="logs" Icon="Document" />
             <NavigationViewItem Content="沙盒设置" Tag="sandbox" Icon="Setting" />
+            <NavigationViewItem Content="运行时设置" Tag="settings" Icon="Setting" />
         </NavigationView.MenuItems>
         <Grid Margin="24,16,24,24">
             <Grid.RowDefinitions>
@@ -157,9 +160,28 @@
                     </ContentControl>
                 </StackPanel>
             </ScrollViewer>
+            <Grid Grid.Row="2" x:Name="DesktopPage" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,0,0,12">
+                    <Button x:Name="DesktopStartButton" Content="启动窗口示例" Click="OnDesktopStartClicked" />
+                    <Button x:Name="DesktopStopButton" Content="关闭桌面" IsEnabled="False"
+                            Click="OnDesktopStopClicked" />
+                    <TextBlock x:Name="DesktopStatus" Text="桌面未启动" VerticalAlignment="Center"
+                               Foreground="#9AA4B2" />
+                </StackPanel>
+                <Border Grid.Row="1" Background="#0B0E13" CornerRadius="8" BorderBrush="#30363D"
+                        BorderThickness="1">
+                    <controls:DwmCompositor x:Name="Compositor" />
+                </Border>
+            </Grid>
             <ListView Grid.Row="2" x:Name="LogsPage" Visibility="Collapsed" FontFamily="Consolas"
                       SelectionMode="None" ScrollViewer.HorizontalScrollBarVisibility="Auto"
                       ScrollViewer.HorizontalScrollMode="Enabled" />
+            <ContentControl Grid.Row="2" x:Name="RuntimeSettingsPage" Visibility="Collapsed"
+                            HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch" />
         </Grid>
     </NavigationView>
 </Page>

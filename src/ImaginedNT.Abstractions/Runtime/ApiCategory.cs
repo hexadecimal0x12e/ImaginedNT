@@ -15,6 +15,9 @@ public enum ApiCategory
     Registry,
     Security,
     Network,
-    Package
+    Package,
+    Com,
+    /// <summary>USER32/DWM window-manager and composition APIs implemented by an App host.</summary>
+    Gui
 }
 

@@ -1,3 +1,5 @@
+using ImaginedNT.App.Gui;
+using ImaginedNT.App.Settings;
 using ImaginedNT.Core.Io;
 using System.Text;
 using ImaginedNT.Core.Diagnostics;
@@ -19,7 +21,10 @@ public sealed partial class MainPage : Page
     private string _sandboxRoot = Path.Combine(ApplicationData.Current.LocalFolder.Path, "sandbox");
     private readonly Dictionary<char, string> _drives = new();
     private readonly TraceLog _log = new(filePath: Path.Combine(ApplicationData.Current.LocalFolder.Path, "app.jsonl"));
+    private readonly RuntimeSettings _runtimeSettings;
+    private readonly RuntimeSettingsView _runtimeSettingsView;
     private ShellSession? _session;
+    private GuiSession? _guiSession;
     private ImaginedProcess[] _processes = [];
     private FileEntry[] _files = [];
     private string _filePath = "C:\\";
@@ -39,18 +44,49 @@ public sealed partial class MainPage : Page
         _storageAccess = new(_log);
         HostFileSystem.GrantedAccess = _storageAccess;
         InitializeComponent();
+        _runtimeSettings = new RuntimeSettings(Path.Combine(ApplicationData.Current.LocalFolder.Path, "runtime-settings.json"), _log);
+        _runtimeSettings.Load();
+        _runtimeSettingsView = new RuntimeSettingsView(_runtimeSettings, _log,
+            () => _drives.Append(new KeyValuePair<char, string>('C', _sandboxRoot)).ToDictionary(d => d.Key, d => d.Value),
+            () => Navigation.SelectedItem = Navigation.MenuItems.OfType<NavigationViewItem>().First(i => (string)i.Tag == "sandbox"));
+        RuntimeSettingsPage.Content = _runtimeSettingsView;
         _timer.Tick += OnTick;
         Navigation.SelectedItem = Navigation.MenuItems[0];
         UpdateSandboxSettings();
         try
         {
-            File.Copy(Path.Combine(Package.Current.InstalledLocation.Path,"shell.exe"), Path.Combine(_sandboxRoot, "shell.exe"));
+            File.Copy(Path.Combine(Package.Current.InstalledLocation.Path, "shell.exe"), Path.Combine(_sandboxRoot, "shell.exec"));
         }
         catch (Exception ex)
         {
             Debug.WriteLine(ex.ToString());
             //ReportError("复制 shell.exe", ex);
         }
+        try
+        {
+            EnsureWindowSample();
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine(ex.ToString());
+            // The window sample is optional until the desktop page is opened.
+        }
+    }
+
+    private void EnsureWindowSample()
+    {
+        // The package stores the native sample under the broker-safe .exec suffix (see the
+        // csproj Link); the older .exe spelling is accepted for unpackaged runs.
+        var source = Path.Combine(Package.Current.InstalledLocation.Path, "window.exec");
+        if (!HostFileSystem.FileExists(source))
+            source = Path.Combine(Package.Current.InstalledLocation.Path, "window.exe");
+        if (!HostFileSystem.FileExists(source))
+            throw new FileNotFoundException("未找到窗口示例 window.exe，请先构建 samples。", source);
+        if (!HostFileSystem.DirectoryExists(_sandboxRoot)) HostFileSystem.CreateDirectory(_sandboxRoot);
+        var target = Path.Combine(_sandboxRoot, "window.exec");
+        if (!HostFileSystem.FileExists(target) ||
+            HostFileSystem.GetInfo(source).LastWriteTimeUtc > HostFileSystem.GetInfo(target).LastWriteTimeUtc)
+            HostFileSystem.Copy(source, target, overwrite: true);
     }
 
     private async void OnLoaded(object sender, RoutedEventArgs args)
@@ -83,7 +119,7 @@ public sealed partial class MainPage : Page
             _session = null;
             await RestoreSandboxAccessAsync();
             if (_closed || _stopping) return;
-            _session = new ShellSession(_sandboxRoot, new Dictionary<char, string>(_drives), _log);
+            _session = new ShellSession(_runtimeSettings.CreateOptions(_sandboxRoot, _drives), _log);
             _filePath = "C:\\";
             FilePathInput.Text = _filePath;
             _files = [];
@@ -150,6 +186,7 @@ public sealed partial class MainPage : Page
         _timer.Stop();
         try
         {
+            await StopDesktopAsync();
             if (_session is not null) await _session.DisposeAsync();
         }
         catch (Exception ex) { _log.Error($"session cleanup failed: {ex}"); }
@@ -166,6 +203,77 @@ public sealed partial class MainPage : Page
     private async void OnStopClicked(object sender, RoutedEventArgs args) => await StopShellAsync();
     private void OnClearClicked(object sender, RoutedEventArgs args) => TerminalText.Text = "";
     private void OnSendClicked(object sender, RoutedEventArgs args) => SendCommand();
+
+    private void SyncDesktop()
+    {
+        try
+        {
+            Compositor.Sync();
+        }
+        catch (Exception ex)
+        {
+            ReportError("刷新窗口桌面", ex);
+        }
+    }
+
+    private async void OnDesktopStartClicked(object sender, RoutedEventArgs args) => await StartDesktopAsync();
+    private async void OnDesktopStopClicked(object sender, RoutedEventArgs args) => await StopDesktopAsync();
+
+    private async Task StartDesktopAsync()
+    {
+        if (_closed || _guiSession is not null) return;
+        DesktopStartButton.IsEnabled = false;
+        DesktopStopButton.IsEnabled = false;
+        DesktopStatus.Text = "正在启动窗口运行时…";
+        try
+        {
+            EnsureWindowSample();
+            var session = new GuiSession(_runtimeSettings.CreateOptions(_sandboxRoot, _drives), _log);
+            _guiSession = session;
+            // RunAsync creates the runtime/manager synchronously before it starts the guest task,
+            // so attach after this call; attaching before it would pass a null manager.
+            var task = session.RunAsync();
+            var windows = session.Windows ?? throw new InvalidOperationException("窗口管理器未创建。");
+            Compositor.Attach(windows);
+            DesktopStopButton.IsEnabled = true;
+            DesktopStatus.Text = "窗口运行时运行中 · 拖动标题栏移动窗口，点击按钮或输入键盘";
+            _log.Info("window desktop started");
+            var exit = await task;
+            DesktopStatus.Text = $"窗口进程已退出（{exit.ExitCode}）";
+        }
+        catch (Exception ex)
+        {
+            DesktopStatus.Text = "窗口启动失败";
+            ReportError("启动窗口示例", ex);
+        }
+        finally
+        {
+            Compositor.Attach(null);
+            if (_guiSession is not null)
+            {
+                try { await _guiSession.DisposeAsync(); }
+                catch (Exception ex) { _log.Error($"window session cleanup failed: {ex}"); }
+                _guiSession = null;
+            }
+            DesktopStartButton.IsEnabled = !_closed;
+            DesktopStopButton.IsEnabled = false;
+        }
+    }
+
+    public async Task StopDesktopAsync()
+    {
+        var session = _guiSession;
+        if (session is null)
+        {
+            Compositor.Attach(null);
+            return;
+        }
+        DesktopStopButton.IsEnabled = false;
+        DesktopStatus.Text = "正在关闭窗口运行时…";
+        try { await session.DisposeAsync(); }
+        catch (Exception ex) { ReportError("关闭窗口示例", ex); }
+        finally { Compositor.Attach(null); }
+    }
 
     private void SendCommand()
     {
@@ -232,6 +340,7 @@ public sealed partial class MainPage : Page
     private async void OnTick(object? sender, object args)
     {
         DrainOutput();
+        if (_page == "desktop") SyncDesktop();
         if (++_ticks < 10) return;
         _ticks = 0;
         UpdateStatus();
@@ -253,9 +362,13 @@ public sealed partial class MainPage : Page
         ProcessesPage.Visibility = _page == "processes" ? Visibility.Visible : Visibility.Collapsed;
         FilesPage.Visibility = _page == "files" ? Visibility.Visible : Visibility.Collapsed;
         RegistryPage.Visibility = _page == "registry" ? Visibility.Visible : Visibility.Collapsed;
+        DesktopPage.Visibility = _page == "desktop" ? Visibility.Visible : Visibility.Collapsed;
         LogsPage.Visibility = _page == "logs" ? Visibility.Visible : Visibility.Collapsed;
         SandboxPage.Visibility = _page == "sandbox" ? Visibility.Visible : Visibility.Collapsed;
+        RuntimeSettingsPage.Visibility = _page == "settings" ? Visibility.Visible : Visibility.Collapsed;
+        if (_page == "settings") _runtimeSettingsView.RefreshSandbox();
         PageError.Text = "";
+        if (_page == "desktop") SyncDesktop();
         if (_loaded) await RefreshPageAsync();
     }
 
@@ -426,8 +539,14 @@ public sealed partial class MainPage : Page
 
     private static string RegistryType(uint type) => type switch
     {
-        0 => "REG_NONE", 1 => "REG_SZ", 2 => "REG_EXPAND_SZ", 3 => "REG_BINARY",
-        4 => "REG_DWORD", 5 => "REG_DWORD_BIG_ENDIAN", 7 => "REG_MULTI_SZ", 11 => "REG_QWORD",
+        0 => "REG_NONE",
+        1 => "REG_SZ",
+        2 => "REG_EXPAND_SZ",
+        3 => "REG_BINARY",
+        4 => "REG_DWORD",
+        5 => "REG_DWORD_BIG_ENDIAN",
+        7 => "REG_MULTI_SZ",
+        11 => "REG_QWORD",
         _ => type.ToString()
     };
 

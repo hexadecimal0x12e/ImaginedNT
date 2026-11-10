@@ -3,6 +3,8 @@ using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using ImaginedNT.Core.Com;
 using ImaginedNT.Core.Diagnostics;
 using ImaginedNT.Core.Native;
 using ImaginedNT.Core.Objects;
@@ -19,9 +21,10 @@ namespace ImaginedNT.Core.Runtime;
 /// </summary>
 public sealed unsafe class ImaginedRuntime : IDisposable
 {
-    private static int _nextVirtualPid = 100;
     private readonly object _gate = new();
+    private readonly DateTimeOffset _startTime = DateTimeOffset.UtcNow;
     private readonly List<ImaginedProcess> _processes = new();
+    private int _maximumVirtualPid = ushort.MaxValue;
     private readonly ConcurrentDictionary<uint, ImaginedThread> _threadsByNativeId = new();
     private int _nextVirtualThreadId = 3;
     private bool _disposed;
@@ -55,6 +58,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         foreach (var source in _dllRedirects.Keys) ResolveLibraryName(source);
         var console = Options.TraceToConsole ? (Options.DiagnosticWriter ?? Console.Error) : null;
         Trace = new TraceLog(console, Options.TraceFile);
+        Memory = new ImaginedNT.Core.Memory.RuntimeMemory(Options.MaximumPhysicalMemoryBytes, Options.MaximumVirtualMemoryBytes, Trace);
         foreach (var source in _dllRedirects.Keys)
             Trace.Emit(TraceKind.Image, $"DLL redirect: {source}.dll -> {ResolveLibraryName(source)}");
 
@@ -93,6 +97,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         Thunks = new IatThunkAllocator(Trace);
         Objects = new ObjectManager(Trace);
         Syscalls = new SyscallDispatcher(this);
+        Com = new ComRuntime(this);
+        foreach (var server in Options.ComServerPaths) Com.RegisterServer(server);
         try
         {
             if (apiAssemblies is not null)
@@ -113,7 +119,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         Trace.Emit(TraceKind.Info,
             $"ImaginedNT runtime started: managed APIs={Apis.Count} native declarations={NativeDeclarations.Count} " +
             $"policy={Options.ImportPolicy} nativePolicy={Options.NativeApiPolicy} termination={Options.TerminationMode} " +
-            $"hostPid={Environment.ProcessId}");
+            $"hostPid={Environment.ProcessId} systemPid={ProcessInformation.SystemProcessId}");
     }
 
     /// <summary>Register an API assembly before loading or running guest code.</summary>
@@ -124,10 +130,11 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         if (_apiAssemblies.Contains(assembly)) return;
         var managedCount = VirtualApiScanner.Register(assembly, Apis);
         var nativeCount = NativeApiScanner.Register(assembly, NativeDeclarations);
+        var comCount = ComScanner.Register(assembly, Com, Trace);
         _apiAssemblies.Add(assembly);
         Trace.Emit(TraceKind.Info,
-            $"registered {managedCount} managed API entry points and {nativeCount} native API declarations " +
-            $"from {assembly.GetName().Name}");
+            $"registered {managedCount} managed API entry points, {nativeCount} native API declarations and " +
+            $"{comCount} COM class(es) from {assembly.GetName().Name}");
     }
 
     public void RegisterLibrary(string path)
@@ -177,12 +184,16 @@ public sealed unsafe class ImaginedRuntime : IDisposable
     internal bool IsDllRedirectPath(string name) => _dllRedirectPaths.Contains(name);
 
     public RuntimeOptions Options { get; }
+    public Memory.RuntimeMemory Memory { get; }
     public TraceLog Trace { get; }
     public ApiRegistry Apis { get; }
     public NativeApiRegistry NativeDeclarations { get; }
     public INativeForwarder NativeApis { get; }
     public IatThunkAllocator Thunks { get; }
     public SyscallDispatcher Syscalls { get; }
+
+    /// <summary>Managed COM subsystem (apartments, class factories, guest vtables, partial forwarding).</summary>
+    public ComRuntime Com { get; }
 
     /// <summary>
     /// Session-wide NT object namespace shared by every imagined process in this runtime.  Handles
@@ -209,6 +220,23 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         lock (_gate) return _processes.FirstOrDefault(p => p.Id == id);
     }
 
+    public IReadOnlyList<ProcessInformation> GetProcessInformation()
+    {
+        lock (_gate)
+            return new[] { new ProcessInformation(this, _startTime) }
+                .Concat(_processes.Where(p => !p.IsTerminating).Select(p => new ProcessInformation(p))).ToArray();
+    }
+
+    public ProcessInformation? GetProcessInformation(int id)
+    {
+        lock (_gate)
+        {
+            if (id == ProcessInformation.SystemProcessId) return new ProcessInformation(this, _startTime);
+            var process = _processes.FirstOrDefault(p => p.Id == id);
+            return process is null ? null : new ProcessInformation(process);
+        }
+    }
+
     public ImaginedProcess CreateProcess(string imagePath, string? commandLine = null, string? currentDirectory = null)
     {
         return CreateProcess(new ProcessCreateOptions
@@ -224,9 +252,14 @@ public sealed unsafe class ImaginedRuntime : IDisposable
     /// use <see cref="ImaginedProcess.LoadImage"/> followed by <see cref="ImaginedProcess.Run"/>,
     /// or <see cref="ImaginedProcess.EnsureMainThread"/> for a child process.
     /// </summary>
-    public ImaginedProcess CreateProcess(ProcessCreateOptions options)
+    public ImaginedProcess CreateProcess(ProcessCreateOptions options) => CreateProcess(options, null);
+
+    /// <summary>创建来宾进程；非空 processId 指定固定 PID，否则随机分配。</summary>
+    internal ImaginedProcess CreateProcess(ProcessCreateOptions options, int? processId)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (processId is <= 0 or ProcessInformation.SystemProcessId)
+            throw new ArgumentOutOfRangeException(nameof(processId));
         var fullPath = Path.GetFullPath(options.ImagePath);
         if (!HostFileSystem.FileExists(fullPath)) throw new FileNotFoundException($"image not found: {fullPath}", fullPath);
 
@@ -240,7 +273,33 @@ public sealed unsafe class ImaginedRuntime : IDisposable
                          ?? throw new InvalidOperationException($"parent process {parentId} does not exist in this runtime");
             }
 
-            var pid = Interlocked.Increment(ref _nextVirtualPid);
+            var pid = processId ?? 0;
+            if (processId.HasValue)
+            {
+                if (_processes.Any(p => p.Id == pid))
+                    throw new InvalidOperationException($"process {pid} already exists in this runtime");
+            }
+            else
+            {
+                var usedPids = _processes.Select(p => p.Id).Append(ProcessInformation.SystemProcessId).Order().ToArray();
+                var occupied = usedPids.Count(id => id <= _maximumVirtualPid);
+                while (occupied == _maximumVirtualPid)
+                {
+                    if (_maximumVirtualPid == int.MaxValue)
+                        throw new InvalidOperationException("virtual process IDs exhausted");
+                    _maximumVirtualPid = (int)Math.Min((long)_maximumVirtualPid * 2 + 1, int.MaxValue);
+                    occupied = usedPids.Count(id => id <= _maximumVirtualPid);
+                    Trace.Emit(TraceKind.Process, $"expanded virtual PID limit to {_maximumVirtualPid}");
+                }
+
+                // 随机选择空闲 PID 的序号，再跳过已占用的 ID，避免范围接近用满时反复碰撞。
+                pid = RandomNumberGenerator.GetInt32(_maximumVirtualPid - occupied) + 1;
+                foreach (var id in usedPids)
+                {
+                    if (id > pid) break;
+                    pid++;
+                }
+            }
             var sandboxRoot = options.SandboxRoot ?? parent?.FileSystem.Root ?? Options.EffectiveSandboxRoot(pid);
             // Win32 guests expect a drive-qualified current directory (cmd.exe builds paths from
             // it); the sandbox maps C:\ to its root.
@@ -260,6 +319,17 @@ public sealed unsafe class ImaginedRuntime : IDisposable
     internal void RemoveProcess(ImaginedProcess process)
     {
         lock (_gate) _processes.Remove(process);
+    }
+
+    /// <summary>Raised once when a virtual process signals its exit, before its resources are disposed.</summary>
+    public event Action<ImaginedProcess>? ProcessExited;
+
+    internal void OnProcessExited(ImaginedProcess process)
+    {
+        if (ProcessExited is not { } exited) return;
+        foreach (Action<ImaginedProcess> handler in exited.GetInvocationList())
+            try { handler(process); }
+            catch (Exception ex) { Trace.Warn($"process {process.Id} exit cleanup failed: {ex}", process.Id); }
     }
 
     // --- host thread / guest process routing ---------------------------------------
@@ -329,6 +399,18 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             IatRva = 0,
             Index = 0
         }, module, GetCurrentThread()?.Process ?? PrimaryProcess)?.Address ?? 0;
+    }
+
+    /// <summary>
+    /// Return the dispatcher address of a registered managed API, creating its thunk on first use.
+    /// Useful for embedding hosts and tests that need to call a managed API directly.
+    /// </summary>
+    public ulong GetManagedApiAddress(string module, string name)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!Apis.TryGet(module, name, out var registration) || registration is null)
+            throw new InvalidOperationException($"managed API is not registered: {module}!{name}");
+        return ManagedImport(registration).Address;
     }
 
     public ulong ResolveExport(ImaginedProcess process, ulong module, string? name, ushort? ordinal = null)
@@ -408,7 +490,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         var registration = export is null ? null : FindExportOverride(mapped, export);
         if (registration is not null) return ManagedImport(registration);
         if (Apis.TryGetExact(mapped.Image.FileName, import.DisplayName, out registration) && registration is not null &&
-            (registration.IsPartiallyImagined || IsFailFastApi(registration) || registration.Category is ApiCategory.Library or ApiCategory.Package ||
+            (registration.IsPartiallyImagined || IsFailFastApi(registration) ||
+                registration.Category is ApiCategory.Library or ApiCategory.Package or ApiCategory.Com ||
                 IsProcessLocalApi(registration) || Options.ImportPolicy != ImportPolicy.NativeFirst || export is null))
             return ManagedImport(registration);
         if (export is null) return null;
@@ -457,6 +540,12 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             "setupapi" or "version" or "winmm" or "imm32" or "uxtheme" or "dwmapi" or
             "activeds" or "netapi32" or "wintrust" or "combase" or "coml2" or "comcat";
 
+    // Keep the CRT mapped per guest for its startup, environment and stdio state.
+    internal bool ShouldLoadLibraryNatively(string path) =>
+        Path.GetFullPath(path).StartsWith(Environment.SystemDirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) &&
+        ApiRegistry.NormalizeModule(path) is not ("msvcrt" or "ucrtbase") &&
+        FindImportedLibrary(path) is null && !IsDllRedirectPath(path);
+
     private static bool IsVolumeApi(ApiRegistration? registration) => registration?.Category == ApiCategory.File &&
         (registration.Name.StartsWith("GetVolume", StringComparison.Ordinal) ||
          registration.Name.StartsWith("GetDiskFreeSpace", StringComparison.Ordinal) ||
@@ -468,10 +557,17 @@ public sealed unsafe class ImaginedRuntime : IDisposable
          registration.Name == "FindVolumeClose" ||
          registration.Name is "NtQueryVolumeInformationFile" or "ZwQueryVolumeInformationFile");
 
-    private static bool IsProcessLocalApi(ApiRegistration? registration) => IsVolumeApi(registration) || registration?.Category == ApiCategory.Library ||
-        registration?.Category == ApiCategory.Memory && registration.Name is
-            "GetProcessHeap" or "HeapCreate" or "HeapDestroy" or "HeapAlloc" or "HeapFree" or "HeapReAlloc" or "HeapSize" or
-            "RtlAllocateHeap" or "RtlFreeHeap" or "RtlReAllocateHeap" or "RtlSizeHeap";
+    private static bool IsGuestMemoryApi(ApiRegistration? registration) => registration?.Category == ApiCategory.Memory &&
+        (registration.Name.StartsWith("Virtual", StringComparison.Ordinal) ||
+         registration.Name.EndsWith("VirtualMemory", StringComparison.Ordinal) ||
+         registration.Name.Contains("Heap", StringComparison.Ordinal) ||
+         registration.Name is "GlobalMemoryStatus" or "GlobalMemoryStatusEx" or "GetPhysicallyInstalledSystemMemory" or
+             "GetProcessMemoryInfo" or "K32GetProcessMemoryInfo" or "NtQueryInformationProcess" or "ZwQueryInformationProcess" or
+             "GetPerformanceInfo" or "K32GetPerformanceInfo");
+
+    private static bool IsProcessLocalApi(ApiRegistration? registration) => IsVolumeApi(registration) || IsGuestMemoryApi(registration) ||
+        registration?.Name is "GetFileType" or "CreatePipe" or "PeekNamedPipe" ||
+        registration?.Category is ApiCategory.Library or ApiCategory.Com or ApiCategory.Process or ApiCategory.Thread or ApiCategory.Console;
 
     private ImportResolution? TryResolveImport(PeImport import, ulong? module = null, ImaginedProcess? process = null,
         string? importingPath = null, int depth = 0)
@@ -493,17 +589,24 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         }
         var policy = Options.ImportPolicy;
         var managedFound = Apis.TryGet(import.ModuleName, import.DisplayName, out var registration);
-        if (registration is not null && (IsFailFastApi(registration) || IsVolumeApi(registration))) return ManagedImport(registration);
+        if (registration is not null &&
+            (IsFailFastApi(registration) || IsProcessLocalApi(registration)))
+            return ManagedImport(registration);
 
         // --host-system-dlls: use the host's fully initialized system DLLs for imports that the
         // managed layer does not implement, instead of mapping an uninitialized guest copy of
         // ntdll/kernel32 into the address space (which ReactOS binaries hit quickly).
-        if (Options.PreferHostSystemDlls && IsHostSystemModule(import.ModuleName))
+        if (Options.PreferHostSystemDlls && Options.AllowNativeForwarding && policy != ImportPolicy.ManagedOnly &&
+            IsHostSystemModule(import.ModuleName) &&
+            ApiRegistry.NormalizeModule(import.ModuleName) is not ("msvcrt" or "ucrtbase"))
         {
             if (managedFound && registration is not null) return ManagedImport(registration);
-            var hostAddress = NativeApis.Resolve(import.ModuleName, import.Name, import.Ordinal, out var nativeDetail);
-            if (hostAddress != 0)
-                return ImportResolution.Native(WrapNativeImport(import, hostAddress), nativeDetail);
+            if (IsNativeForwardingAllowed(import.ModuleName, import.Name, import.Ordinal))
+            {
+                var hostAddress = NativeApis.Resolve(import.ModuleName, import.Name, import.Ordinal, out var nativeDetail);
+                if (hostAddress != 0)
+                    return ImportResolution.Native(WrapNativeImport(import, hostAddress), nativeDetail);
+            }
         }
         // Package identity belongs to the guest even under native-first import policy.
         if (registration?.Category == ApiCategory.Package) return ManagedImport(registration);
@@ -514,13 +617,23 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         {
             var path = process.FindLibraryPath(import.ModuleName, importingPath, partial);
             if (path is not null)
+            {
+                // Windows system DLLs require the host loader's private initialization state.
+                if (ShouldLoadLibraryNatively(path))
+                {
+                    if (managedFound && registration is not null) return ManagedImport(registration);
+                    if (!IsNativeForwardingAllowed(import.ModuleName, import.Name, import.Ordinal)) return null;
+                    var address = NativeApis.Resolve(path, import.Name, import.Ordinal, out var detail);
+                    return address == 0 ? null : ImportResolution.Native(WrapNativeImport(import, address), detail);
+                }
                 mapped = process.LoadManagedLibrary(path) ?? throw new BadImageFormatException($"could not load guest DLL '{path}'");
+            }
         }
         if (mapped is not null) return ResolveMappedExport(process!, mapped, import, depth);
         if (registration is { IsPartiallyImagined: true }) return ManagedImport(registration);
         if (partial && !NativeDeclarations.IsDeclared(import.ModuleName, import.DisplayName)) return null;
 
-        // Loader and heap operations retain their guest ownership under native-first policy.
+        // Loader and memory operations retain their guest ownership under native-first policy.
         if (policy == ImportPolicy.NativeFirst && !IsProcessLocalApi(registration))
         {
             if (Options.AllowNativeForwarding && IsNativeForwardingAllowed(import.ModuleName, import.Name, import.Ordinal))
@@ -646,7 +759,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         var context = new ApiCallContext(process, thread!, module, name, 0, returnAddress, copied, returnAddressSlot);
         try
         {
-            if (registration is null || (!registration.IsPartiallyImagined && !IsVolumeApi(registration) && NativeHandleBridge.NeedsNative(context)))
+            if (registration is null ||
+                (!registration.IsPartiallyImagined && !IsProcessLocalApi(registration) && NativeHandleBridge.NeedsNative(context)))
             {
                 if (!Options.AllowNativeForwarding || Options.ImportPolicy == ImportPolicy.ManagedOnly ||
                     !IsNativeForwardingAllowed(module, name) ||
@@ -787,7 +901,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
 
     private ulong InvokeManagedHandler(ApiRegistration registration, ApiCallContext context)
     {
-        if (registration.IsPartiallyImagined || IsVolumeApi(registration) || !NativeHandleBridge.NeedsNative(context)) return registration.Handler(context);
+        if (registration.IsPartiallyImagined || IsProcessLocalApi(registration) || !NativeHandleBridge.NeedsNative(context))
+            return registration.Handler(context);
         var allowed = Options.AllowNativeForwarding && Options.ImportPolicy != ImportPolicy.ManagedOnly &&
                       IsNativeForwardingAllowed(context.Module, context.Name);
         var target = allowed ? NativeApis.Resolve(context.Module, context.Name, null, out _) : 0;
@@ -894,6 +1009,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             _diagnosticHandler = IntPtr.Zero;
         }
         if (ReferenceEquals(_diagnosticRuntime, this)) _diagnosticRuntime = null;
+        try { Com.Dispose(); } catch { }
         try { Objects.Dispose(); } catch { }
         Thunks.Dispose();
         NativeApis.Dispose();

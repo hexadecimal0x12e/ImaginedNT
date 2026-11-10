@@ -26,6 +26,7 @@ public sealed class MemoryQueryResult
     public ulong RegionSize { get; init; }
     public MemoryState State { get; init; }
     public MemoryProtection Protection { get; init; }
+    public MemoryProtection AllocationProtection { get; init; }
     public MemoryType Type { get; init; }
     public string? Label { get; init; }
 }
@@ -49,16 +50,19 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
 
     private readonly object _gate = new();
     private readonly List<MemoryRegion> _regions = new();
-    private readonly List<ulong> _ownedAllocations = new();
+    private readonly Dictionary<ulong, ulong> _ownedAllocations = new();
+    private readonly RuntimeMemory _memory;
     private readonly Dictionary<ulong, (ulong Address, uint Count)> _functionTables = new();
     private readonly Diagnostics.TraceLog? _trace;
     private readonly int _pid;
     private bool _disposed;
 
-    public VirtualMemoryManager(Diagnostics.TraceLog? trace = null, int pid = 0)
+    public VirtualMemoryManager(Diagnostics.TraceLog? trace = null, int pid = 0, RuntimeMemory? memory = null)
     {
         _trace = trace;
         _pid = pid;
+        _memory = memory ?? new RuntimeMemory();
+        _memory.RegisterProcess(pid);
     }
 
     public IReadOnlyList<MemoryRegion> Regions
@@ -84,57 +88,52 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
 
     public void AddRegion(MemoryRegion region)
     {
-        lock (_gate) _regions.Add(region);
+        lock (_gate)
+        {
+            var overlaps = _regions.Where(r => r.BaseAddress < region.EndAddress && region.BaseAddress < r.EndAddress).ToArray();
+            foreach (var r in overlaps)
+            {
+                _regions.Remove(r);
+                if (r.BaseAddress < region.BaseAddress) _regions.Add(Slice(r, r.BaseAddress, region.BaseAddress));
+                if (r.EndAddress > region.EndAddress) _regions.Add(Slice(r, region.EndAddress, r.EndAddress));
+            }
+            _regions.Add(region);
+        }
     }
 
-    /// <summary>Reserve/commit a new image mapping with RWX and remember its allocation.</summary>
+    private static MemoryRegion Slice(MemoryRegion r, ulong start, ulong end) => new()
+    {
+        BaseAddress = start, RegionSize = end - start, AllocationBase = r.AllocationBase,
+        AllocationSize = r.AllocationSize, Protection = r.Protection, State = r.State, Type = r.Type, Label = r.Label
+    };
+
     public ulong MapImage(ulong preferredBase, ulong sizeOfImage, string label)
     {
         var size = GranularityAlign(sizeOfImage);
-        var address = Native.NativeMethods.VirtualAlloc(
-            preferredBase == 0 ? IntPtr.Zero : (IntPtr)(long)preferredBase,
-            (UIntPtr)size,
-            Native.NativeMethods.MEM_RESERVE | Native.NativeMethods.MEM_COMMIT,
-            Native.NativeMethods.PAGE_EXECUTE_READWRITE);
-
-        if (address == IntPtr.Zero && preferredBase != 0)
-        {
-            address = Native.NativeMethods.VirtualAlloc(IntPtr.Zero, (UIntPtr)size,
-                Native.NativeMethods.MEM_RESERVE | Native.NativeMethods.MEM_COMMIT,
-                Native.NativeMethods.PAGE_EXECUTE_READWRITE);
-        }
-
-        if (address == IntPtr.Zero)
-        {
-            var error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-            throw new NtMemoryException(NtStatus.FromWin32(error), $"VirtualAlloc failed for image {label} (0x{size:X}) err={error}");
-        }
-
-        var actual = (ulong)(long)address;
-        lock (_gate) _ownedAllocations.Add(actual);
+        if (sizeOfImage == 0 || size == 0) throw new NtMemoryException(NtStatus.InvalidParameter, "invalid image size");
+        var status = TryAllocate(preferredBase, size, MemoryProtection.ExecuteReadWrite,
+            AllocationType.Reserve | AllocationType.Commit, out var address, out _, label);
+        if (!NtStatus.IsSuccess(status) && preferredBase != 0)
+            status = TryAllocate(0, size, MemoryProtection.ExecuteReadWrite,
+                AllocationType.Reserve | AllocationType.Commit, out address, out _, label);
+        if (!NtStatus.IsSuccess(status)) throw new NtMemoryException(status, $"could not map image {label} (size=0x{size:X}, status=0x{status:X8})");
         AddRegion(new MemoryRegion
         {
-            BaseAddress = actual,
-            RegionSize = size,
-            AllocationBase = actual,
-            AllocationSize = size,
-            Protection = MemoryProtection.ExecuteReadWrite,
-            State = MemoryState.Commit,
-            Type = MemoryType.Image,
-            Label = label
+            BaseAddress = address, RegionSize = size, AllocationBase = address, AllocationSize = size,
+            Protection = MemoryProtection.ExecuteReadWrite, State = MemoryState.Commit, Type = MemoryType.Image, Label = label
         });
-        _trace?.Emit(Diagnostics.TraceKind.Memory, $"mapped image {label} size=0x{size:X} at 0x{actual:X16} (preferred 0x{preferredBase:X16})", _pid);
-        return actual;
+        return address;
     }
 
     public void AddImageSection(ulong baseAddress, ulong size, MemoryProtection protection, string label)
     {
+        var owner = FindRegion(baseAddress);
         AddRegion(new MemoryRegion
         {
             BaseAddress = baseAddress,
             RegionSize = size,
-            AllocationBase = baseAddress,
-            AllocationSize = size,
+            AllocationBase = owner?.AllocationBase ?? baseAddress,
+            AllocationSize = owner?.AllocationSize ?? size,
             Protection = protection,
             State = MemoryState.Commit,
             Type = MemoryType.Image,
@@ -145,113 +144,83 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
     public uint TryAllocate(ulong requestedBase, ulong size, MemoryProtection protection, AllocationType type,
         out ulong actualBase, out ulong actualSize, string? label = null)
     {
-        actualBase = 0;
-        actualSize = 0;
-        if (size == 0) return NtStatus.InvalidParameter;
-        if ((type & (AllocationType.Reserve | AllocationType.Commit)) == 0) return NtStatus.InvalidParameter;
-
-        // Windows accepts VirtualAlloc(NULL, size, MEM_COMMIT, ...) and commits a fresh region.
-        // Treat it as reserve+commit so the allocation is tracked and released as a unit.
-        if ((type & AllocationType.Reserve) == 0 && requestedBase == 0)
-            type |= AllocationType.Reserve;
-
-        if (requestedBase != 0)
+        actualBase = actualSize = 0;
+        if (size == 0 || size > ulong.MaxValue - AllocationGranularity || requestedBase > ulong.MaxValue - size - PageSize)
+            return NtStatus.InvalidParameter;
+        if ((type & ~(AllocationType.Reserve | AllocationType.Commit | AllocationType.TopDown)) != 0 ||
+            (type & (AllocationType.Reserve | AllocationType.Commit)) == 0) return NtStatus.InvalidParameter;
+        if (requestedBase == 0) type |= AllocationType.Reserve;
+        var start = requestedBase & ~((type.HasFlag(AllocationType.Reserve) ? AllocationGranularity : PageSize) - 1);
+        var length = PageAlign(size + requestedBase - start);
+        lock (_memory.Gate)
+        lock (_gate)
         {
-            requestedBase = (type & AllocationType.Reserve) != 0
-                ? requestedBase & ~(AllocationGranularity - 1)
-                : requestedBase & ~(PageSize - 1);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var owner = _ownedAllocations.FirstOrDefault(a => start >= a.Key && start - a.Key < a.Value);
+            if (!type.HasFlag(AllocationType.Reserve) && (owner.Value == 0 || length > owner.Value - (start - owner.Key)))
+                return NtStatus.InvalidAddress;
+            var commit = type.HasFlag(AllocationType.Commit) ? length : 0;
+            if (commit != 0 && owner.Value != 0)
+                commit -= CommittedBytes(start, start + length);
+            if (!_memory.CanAllocate(commit, type.HasFlag(AllocationType.Reserve) ? length : 0)) return NtStatus.NoMemory;
+            var address = Native.NativeMethods.VirtualAlloc((IntPtr)(long)start, (UIntPtr)length, (uint)type,
+                (uint)protection);
+            if (address == IntPtr.Zero) return NtStatus.FromWin32(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+            actualBase = (ulong)(long)address;
+            actualSize = length;
+            if (type.HasFlag(AllocationType.Reserve)) _ownedAllocations.Add(actualBase, length);
+            var previous = FindRegion(actualBase);
+            AddRegion(new MemoryRegion
+            {
+                BaseAddress = actualBase, RegionSize = length,
+                AllocationBase = type.HasFlag(AllocationType.Reserve) ? actualBase : owner.Key,
+                AllocationSize = type.HasFlag(AllocationType.Reserve) ? length : owner.Value,
+                Protection = protection, State = type.HasFlag(AllocationType.Commit) ? MemoryState.Commit : MemoryState.Reserve,
+                Type = previous?.Type ?? MemoryType.Private, Label = label ?? previous?.Label
+            });
+            _memory.UpdateUsage(_pid, 0, 0, commit, type.HasFlag(AllocationType.Reserve) ? length : 0);
+            return NtStatus.Success;
         }
-
-        var allocSize = (type & AllocationType.Reserve) != 0 ? GranularityAlign(size) : PageAlign(size);
-        var hostType = 0u;
-        if ((type & AllocationType.Reserve) != 0) hostType |= Native.NativeMethods.MEM_RESERVE;
-        if ((type & AllocationType.Commit) != 0) hostType |= Native.NativeMethods.MEM_COMMIT;
-        if ((type & AllocationType.Reset) != 0) hostType |= 0x0008_0000;
-        if ((type & AllocationType.LargePages) != 0) hostType |= 0x2000_0000;
-
-        var addr = Native.NativeMethods.VirtualAlloc(
-            requestedBase == 0 ? IntPtr.Zero : (IntPtr)(long)requestedBase,
-            (UIntPtr)allocSize,
-            hostType,
-            Native.NativeMethods.ToPageProtection((uint)protection));
-
-        if (addr == IntPtr.Zero)
-        {
-            var err = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-            return NtStatus.FromWin32(err);
-        }
-
-        actualBase = (ulong)(long)addr;
-        actualSize = allocSize;
-        if ((type & AllocationType.Reserve) != 0)
-        {
-            lock (_gate) _ownedAllocations.Add(actualBase);
-        }
-
-        AddRegion(new MemoryRegion
-        {
-            BaseAddress = actualBase,
-            RegionSize = actualSize,
-            AllocationBase = actualBase,
-            AllocationSize = actualSize,
-            Protection = protection,
-            State = (type & AllocationType.Commit) != 0 ? MemoryState.Commit : MemoryState.Reserve,
-            Type = MemoryType.Private,
-            Label = label
-        });
-
-        _trace?.Emit(Diagnostics.TraceKind.Memory,
-            $"NtAllocateVirtualMemory base=0x{actualBase:X16} size=0x{actualSize:X} type={type} prot={protection}", _pid);
-        return NtStatus.Success;
     }
 
-    public uint TryCommit(ulong baseAddress, ulong size, MemoryProtection protection)
-    {
-        if (baseAddress == 0 || size == 0) return NtStatus.InvalidParameter;
-        var alignedBase = baseAddress & ~(PageSize - 1);
-        var alignedSize = PageAlign(baseAddress + size) - alignedBase;
-        var addr = Native.NativeMethods.VirtualAlloc((IntPtr)(long)alignedBase, (UIntPtr)alignedSize,
-            Native.NativeMethods.MEM_COMMIT, Native.NativeMethods.ToPageProtection((uint)protection));
-        if (addr == IntPtr.Zero)
-        {
-            return NtStatus.FromWin32(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
-        }
+    public uint TryCommit(ulong baseAddress, ulong size, MemoryProtection protection) =>
+        baseAddress == 0 ? NtStatus.InvalidParameter :
+        TryAllocate(baseAddress, size, protection, AllocationType.Commit, out _, out _);
 
-        AddRegion(new MemoryRegion
-        {
-            BaseAddress = alignedBase,
-            RegionSize = alignedSize,
-            AllocationBase = alignedBase,
-            AllocationSize = alignedSize,
-            Protection = protection,
-            State = MemoryState.Commit,
-            Type = MemoryType.Private
-        });
-        _trace?.Emit(Diagnostics.TraceKind.Memory, $"commit 0x{baseAddress:X16} size=0x{size:X} prot={protection}", _pid);
-        return NtStatus.Success;
+    private ulong CommittedBytes(ulong start, ulong end)
+    {
+        ulong committed = 0;
+        foreach (var region in _regions)
+            if (region.State == MemoryState.Commit && region.BaseAddress < end && region.EndAddress > start)
+                committed += Math.Min(region.EndAddress, end) - Math.Max(region.BaseAddress, start);
+        return committed;
     }
 
     public uint TryProtect(ulong baseAddress, ulong size, MemoryProtection protection, out MemoryProtection oldProtection)
     {
         oldProtection = MemoryProtection.NoAccess;
         if (baseAddress == 0 || size == 0) return NtStatus.InvalidParameter;
-        var addr = (IntPtr)(long)baseAddress;
-        if (!Native.NativeMethods.VirtualProtect(addr, (UIntPtr)size, Native.NativeMethods.ToPageProtection((uint)protection), out var old))
+        if (size > ulong.MaxValue - PageSize || baseAddress > ulong.MaxValue - size - PageSize) return NtStatus.InvalidParameter;
+        lock (_memory.Gate)
+        lock (_gate)
         {
-            return NtStatus.FromWin32(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
-        }
+            var region = FindRegion(baseAddress);
+            if (!Native.NativeMethods.VirtualProtect((IntPtr)(long)baseAddress, (UIntPtr)size, (uint)protection, out var old))
+                return NtStatus.FromWin32(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
-        oldProtection = (MemoryProtection)Native.NativeMethods.ToNtProtection(old);
-        AddRegion(new MemoryRegion
-        {
-            BaseAddress = baseAddress & ~(PageSize - 1),
-            RegionSize = PageAlign(baseAddress + size) - (baseAddress & ~(PageSize - 1)),
-            AllocationBase = baseAddress & ~(PageSize - 1),
-            AllocationSize = PageAlign(size),
-            Protection = protection,
-            State = MemoryState.Commit,
-            Type = MemoryType.Private
-        });
+            oldProtection = (MemoryProtection)Native.NativeMethods.ToNtProtection(old);
+            AddRegion(new MemoryRegion
+            {
+                BaseAddress = baseAddress & ~(PageSize - 1),
+                RegionSize = PageAlign(baseAddress + size) - (baseAddress & ~(PageSize - 1)),
+                AllocationBase = region?.AllocationBase ?? baseAddress,
+                AllocationSize = region?.AllocationSize ?? PageAlign(size),
+                Protection = protection,
+                State = MemoryState.Commit,
+                Type = region?.Type ?? MemoryType.Private,
+                Label = region?.Label
+            });
+        }
         _trace?.Emit(Diagnostics.TraceKind.Memory, $"protect 0x{baseAddress:X16} size=0x{size:X} {oldProtection} -> {protection}", _pid);
         return NtStatus.Success;
     }
@@ -259,13 +228,24 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
     public uint TryFree(ulong baseAddress, ulong size, FreeType freeType)
     {
         if (baseAddress == 0) return NtStatus.InvalidParameter;
+        if (freeType != FreeType.Release && freeType != FreeType.Decommit) return NtStatus.InvalidParameter;
+        if (freeType == FreeType.Release && size != 0) return NtStatus.InvalidParameter;
+        if (size > ulong.MaxValue - PageSize || baseAddress > ulong.MaxValue - size - PageSize) return NtStatus.InvalidParameter;
         var hostType = 0u;
         if ((freeType & FreeType.Decommit) != 0) hostType |= Native.NativeMethods.MEM_DECOMMIT;
         if ((freeType & FreeType.Release) != 0) hostType |= Native.NativeMethods.MEM_RELEASE;
         if (hostType == 0) return NtStatus.InvalidParameter;
 
+        lock (_memory.Gate)
         lock (_gate)
         {
+            var owner = _ownedAllocations.FirstOrDefault(a => baseAddress >= a.Key && baseAddress - a.Key < a.Value);
+            if (owner.Value == 0 || (freeType == FreeType.Release && owner.Key != baseAddress)) return NtStatus.InvalidAddress;
+            if (freeType == FreeType.Decommit && size == 0 && owner.Key != baseAddress) return NtStatus.InvalidParameter;
+            if (size != 0 && size > owner.Value - (baseAddress - owner.Key)) return NtStatus.InvalidParameter;
+            var start = baseAddress & ~(PageSize - 1);
+            var end = freeType == FreeType.Release || size == 0 ? owner.Key + owner.Value : PageAlign(baseAddress + size);
+            var committed = CommittedBytes(start, end);
             var registered = (freeType & FreeType.Release) != 0 && _functionTables.ContainsKey(baseAddress);
             var table = _functionTables.GetValueOrDefault(baseAddress);
             if (registered && !Native.NativeMethods.RtlDeleteFunctionTable((nint)table.Address))
@@ -285,18 +265,22 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
                 }
                 return status;
             }
+            _memory.UpdateUsage(_pid, committed, freeType == FreeType.Release ? owner.Value : 0, 0, 0);
             if (registered) _functionTables.Remove(baseAddress);
-            var allocationRegion = _regions.FirstOrDefault(r => r.BaseAddress == baseAddress);
-            var effectiveSize = size != 0 ? size : allocationRegion?.RegionSize ?? 0;
-            if ((freeType & FreeType.Release) != 0)
+            if (freeType == FreeType.Release)
             {
                 _ownedAllocations.Remove(baseAddress);
-                _regions.RemoveAll(r => r.BaseAddress >= baseAddress &&
-                                        (effectiveSize == 0 || r.BaseAddress < baseAddress + effectiveSize));
+                _regions.RemoveAll(r => r.BaseAddress >= owner.Key && r.BaseAddress < owner.Key + owner.Value);
             }
             else
             {
-                _regions.RemoveAll(r => r.BaseAddress >= baseAddress && r.BaseAddress < baseAddress + effectiveSize);
+                var region = FindRegion(start);
+                AddRegion(new MemoryRegion
+                {
+                    BaseAddress = start, RegionSize = end - start, AllocationBase = owner.Key, AllocationSize = owner.Value,
+                    State = MemoryState.Reserve, Protection = MemoryProtection.NoAccess,
+                    Type = region?.Type ?? MemoryType.Private, Label = region?.Label
+                });
             }
         }
 
@@ -318,7 +302,6 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
 
     public MemoryQueryResult? Query(ulong address)
     {
-        if (address == 0) return null;
         if (Native.NativeMethods.VirtualQuery((IntPtr)(long)address, out var info, (UIntPtr)System.Runtime.InteropServices.Marshal.SizeOf<Native.NativeMethods.MEMORY_BASIC_INFORMATION>()) == 0)
         {
             return null;
@@ -333,7 +316,8 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
             AllocationBase = (ulong)(long)info.AllocationBase,
             RegionSize = (ulong)info.RegionSize,
             State = state,
-            Protection = (MemoryProtection)Native.NativeMethods.ToNtProtection(info.Protect),
+            Protection = (MemoryProtection)info.Protect,
+            AllocationProtection = (MemoryProtection)info.AllocationProtect,
             Type = type,
             Label = label
         };
@@ -463,28 +447,16 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
 
     public void Dispose()
     {
+        lock (_memory.Gate)
         lock (_gate)
         {
             if (_disposed) return;
             _disposed = true;
-            // Release allocations that were not already released.  This is important for test
-            // hosts which load several images into one process.  In a one-shot runner the process
-            // exits immediately afterwards, so leaking would also be harmless.
-            foreach (var baseAddress in _ownedAllocations.ToArray())
+            foreach (var baseAddress in _ownedAllocations.Keys.ToArray())
             {
-                if (_functionTables.TryGetValue(baseAddress, out var table))
-                {
-                    if (!Native.NativeMethods.RtlDeleteFunctionTable((nint)table.Address))
-                    {
-                        _trace?.Warn($"could not unregister exception table at 0x{table.Address:X}; retaining image", _pid);
-                        continue;
-                    }
-                    _functionTables.Remove(baseAddress);
-                }
-                Native.NativeMethods.VirtualFree((IntPtr)(long)baseAddress, UIntPtr.Zero, Native.NativeMethods.MEM_RELEASE);
+                var status = TryFree(baseAddress, 0, FreeType.Release);
+                if (!NtStatus.IsSuccess(status)) _trace?.Warn($"could not release guest allocation at 0x{baseAddress:X}: 0x{status:X8}", _pid);
             }
-            _ownedAllocations.Clear();
-            _regions.Clear();
         }
     }
 }

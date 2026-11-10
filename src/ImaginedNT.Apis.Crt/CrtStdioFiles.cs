@@ -20,7 +20,7 @@ internal sealed partial class CrtStdioState
         var old = reopen ? ctx.Arg(first + 2) : 0;
         if (reopen && !_streams.ContainsKey(old)) return Error(ctx, name, 9);
         if (!reopen && StreamCount >= _maxStdio) return Error(ctx, name, 24);
-        var hostPath = ctx.Process.FileSystem.MapPath(path, ctx.Process.CurrentDirectory);
+        var hostPath = ctx.Process.FileSystem.MapNativePath(path, ctx.Process.CurrentDirectory, mode[0] == 'r' || mode.Contains('+'), mode[0] != 'r' || mode.Contains('+'));
         if (!mode.Contains('b') && !mode.Contains('t') &&
             CrtMemory.Read(ctx, CrtProcessState.GetFileModes(ctx), out int defaultMode) && defaultMode == 0x8000)
             mode += "b";
@@ -82,7 +82,7 @@ internal sealed partial class CrtStdioState
             flags |= defaultMode;
         var sharing = shared ? ctx.ArgInt32(first + 2) : 0x40;
         var permission = ctx.ArgInt32(first + (create ? 1 : shared ? 3 : 2));
-        var hostPath = ctx.Process.FileSystem.MapPath(path, ctx.Process.CurrentDirectory);
+        var hostPath = ctx.Process.FileSystem.MapNativePath(path, ctx.Process.CurrentDirectory, (flags & 3) != 1, (flags & 3) != 0 || (flags & 0x740) != 0);
         var host = -1;
         int result;
         if (HostFileSystem.UseAppContainerApis)
@@ -152,7 +152,7 @@ internal sealed partial class CrtStdioState
             path = make ? template[..^6] + Guid.NewGuid().ToString("N")[..6] :
                 directory.TrimEnd('\\', '/') + "\\" + prefix + Guid.NewGuid().ToString("N")[..12] + ".tmp";
         } while (ctx.Process.FileSystem.Exists(path, ctx.Process.CurrentDirectory));
-        var hostPath = ctx.Process.FileSystem.MapPath(path, ctx.Process.CurrentDirectory);
+        var hostPath = ctx.Process.FileSystem.MapNativePath(path, ctx.Process.CurrentDirectory, true, true);
         if (file)
         {
             if (!ctx.Process.FileSystem.AllowWrites) return Error(ctx, name, 13);

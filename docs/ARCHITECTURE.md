@@ -18,7 +18,8 @@
 **Non-goals (for this version)**
 
 - A complete Win32/Win64 personality. There is no PEB/TEB setup, no CRT startup, no SEH/unwind
-  metadata installation, no COM/GDI/USER32, no 32-bit images.
+  metadata installation, no GDI/USER32, no 32-bit images. The COM layer covers in-process
+  activation and vtables, not DCOM/proxies/marshaling.
 - A security sandbox in the kernel sense. See `LIMITATIONS-AND-SECURITY.md`.
 - Running arbitrary Windows applications unchanged. The samples are CRT-free PE executables
   linked with `/NODEFAULTLIB` and a custom entry point.
@@ -30,6 +31,7 @@ ImaginedNT.Host process
  ├─ ImaginedRuntime
  │   ├─ ApiRegistry          148 managed entry points
  │   ├─ IatThunkAllocator    one 64 KiB RWX page, universal stub + 16-byte API stubs
+ │   ├─ ComRuntime           apartments, class factories, guest vtables, partial forwarding
  │   ├─ NativeForwarder      LoadLibrary/GetProcAddress cache
  │   ├─ SyscallDispatcher    virtual numbers + host ntdll numbers
  │   ├─ ObjectManager        session object namespace (\BaseNamedObjects, symlinks)
@@ -397,6 +399,72 @@ function pointers inside a guest DLL without overwriting short functions or adja
 Each process owns its redirectors and removes them before freeing its DLL mappings. Inlined
 code and DLLs loaded by the host Windows loader remain outside this boundary.
 
+## 11.2 COM runtime
+
+`ComRuntime` (owned by `ImaginedRuntime.Com`) implements the in-process COM surface on top of the
+same thunk arena as managed imports. Its data model is:
+
+```
+ComClassDescriptor        CLSID, threading model, interfaces, factory, optional host CLSID
+  ComInterfaceBinding     one COM interface definition + the managed methods implemented by this class
+    ComInterfaceDefinition  IID, name, slot -> method name (slots 3+; IUnknown is 0-2)
+ComObject                 one guest-visible object: shared identity and reference count
+  ComInterfaceView        one guest interface block: { void** vtable }, IID, optional host pointer
+```
+
+### Guest-visible vtables
+
+Each interface view is a small host-heap block whose first qword is a guest-readable vtable. The
+vtable contains 8-byte addresses: slots 0-2 are the runtime's `IUnknown` thunks, and slots 3+ are
+either managed method thunks or `this`-rewriting native trampolines. A managed method thunk is a
+normal `IatThunkAllocator` thunk; its dispatcher finds the `ComInterfaceView` from the `this`
+pointer in RCX, builds an `ApiCallContext` and `ComCallContext`, and invokes the bound C# method.
+Vtables for fully managed classes are shared per class/interface; partially imagined objects get
+per-instance vtables because their forwarded entries embed the host interface pointer.
+
+`QueryInterface`/`AddRef`/`Release` are implemented once for all objects. `QueryInterface` returns
+the existing view for an IID (or the same view for `IID_IUnknown`) and increments the object's
+shared count; `Release` to zero removes every view from the runtime's lookup table, releases host
+interface references, frees interface blocks/vtables and disposes the managed state object.
+
+### Partially Imagined COM
+
+For a `PartiallyImaginedComClassAttribute`, the object is created from the host CLSID (real host
+COM) or from a registered host factory. For every declared interface the runtime stores a host
+interface pointer. Managed overrides use the ordinary method thunk; every other slot uses an
+emitted trampoline:
+
+```
+mov rcx, hostInterfaceThis   ; 48 B9 imm64
+mov rax, hostVtable[slot]    ; 48 B8 imm64
+jmp rax                      ; FF E0
+```
+
+This changes only `this`; RDX/R8/R9, XMM0-3, stack arguments and the return path are untouched, so
+the host COM method sees exactly the guest's arguments. Because the guest runs in the host address
+space, no cross-process marshaling is needed. A CLR CCW used as the host must expose COM-native
+signatures (`[PreserveSig]` on its interface methods); otherwise the CLR inserts an `[out, retval]`
+parameter and the vtable layout differs from the guest interface.
+
+### Class factories, servers and lifetimes
+
+`CoGetClassObject` creates a managed `IClassFactory` object for a managed class. Its
+`CreateInstance` calls back into `ComRuntime.CreateInstance`; `LockServer` adjusts the descriptor's
+lock count. `CoCreateInstance` tries managed classes first, then guest class objects registered
+with `CoRegisterClassObject`, then registered in-process server DLLs, and finally the host's COM
+registry when native forwarding is enabled.
+
+`CoLoadLibrary`/`CoFreeLibrary` load a server lazily per guest process. Guest servers use the
+managed PE loader and expose `DllGetClassObject`/`DllCanUnloadNow` through the normal export
+resolver; host servers are loaded with the host loader. `DllGetClassObject` is called with raw
+`GUID*` arguments; the returned interface pointer is a guest pointer. Guest mappings are never
+unmapped (matching `FreeLibrary`); host modules are released when `DllCanUnloadNow` agrees.
+
+`ImaginedProcess.Dispose` asks `ComRuntime.ReleaseProcess` to destroy that process's objects before
+its address space is freed. `ImaginedRuntime.Dispose` then disposes the COM runtime after all
+processes and before the thunk arena. Apartment state lives in a `ConditionalWeakTable` keyed by
+`ImaginedThread` and is released with the thread.
+
 ## 12. Concurrency, GC and native callbacks
 
 - `IatThunkAllocator` keeps every managed thunk handler in a static
@@ -485,6 +553,34 @@ Set `RuntimeOptions.NativeForwarderFactory` to construct a custom `INativeForwar
 runtime's `TraceLog`. The runtime owns and disposes the returned instance. Other backend services
 continue to use the Windows implementations in this split.
 
+**Add a COM class**
+
+Declare the interface ABI with `[VirtualComInterface]` and `[VirtualComMethod]` on a C# interface,
+then implement it in a `[VirtualComClass]` class. Method implementations are instance methods with
+the signature `ulong Name(ComCallContext context)`; argument 0 is the interface `this`, and the
+return value is the HRESULT. Register the API assembly with `RegisterApis` or select it in
+`BuiltinApis.Assemblies`; `ComScanner` discovers interfaces/classes during assembly registration.
+
+```csharp
+[VirtualComInterface("{...IID...}", "IMyCom")]
+public interface IMyCom
+{
+    [VirtualComMethod("{...IID...}", 3, "Ping")]
+    ulong Ping(ComCallContext context);
+}
+
+[VirtualComClass("{...CLSID...}", "My.Com")]
+public sealed class MyCom : IMyCom
+{
+    public ulong Ping(ComCallContext context) => ComHResult.AsReturnValue(ComHResult.S_OK);
+}
+```
+
+For partial replacement, use `[PartiallyImaginedComClass(guestClsid, hostClsid)]` and annotate only
+the overridden methods with `[PartiallyImaginedComMethod]`; slots without an override are forwarded
+to the host object. Add a test to `tests/ImaginedNT.Tests/ComTests.cs` (or extend
+`samples/comtest/comtest.c` for a guest-ABI test).
+
 **Add a syscall**
 
 - Virtual: register a number in `SyscallDispatcher` (`0x1000..` is reserved for ImaginedNT).
@@ -500,3 +596,37 @@ Register imports under the classic module name; add module aliases/API-set prefi
 
 The parser/mapper is deliberately separate: add the data-directory parser in `PeImage`, then
 apply it in `PeLoader` before protections are set. Section protections must be applied last.
+
+## 14. GUI window personality (App layer)
+
+The window manager is deliberately **not** part of `ImaginedNT.Apis`.  It needs a compositor, a
+virtual screen and a UI thread, so it lives in the UWP App project:
+`src/ImaginedNT.App/Gui` owns the USER32/DWM registrations and `src/ImaginedNT.App/Controls`
+owns the XAML compositor.
+
+```
+ImaginedNT.App
+  Gui/WindowManager       classes, geometry, z-order, focus, colours, timers
+    ThreadMessageQueue    one queue per guest thread; WaitForMessage/Post
+  Gui/WindowApis          [VirtualApi] USER32 shims
+  Gui/DwmApis             [VirtualApi] DWM shims
+  Gui/GuiLibrary          runtime -> manager attachment (ConditionalWeakTable)
+  Gui/GuiSession          own ImaginedRuntime + built-in API set + App assembly
+  Controls/DwmCompositor  XAML surfaces + pointer/keyboard forwarding
+```
+
+`GuiSession` creates a second `ImaginedRuntime` (the shell session keeps its own), registers
+`typeof(WindowApis).Assembly` on top of `BuiltinApis.Assemblies`, and attaches a
+`WindowManager` before running the guest.  Window APIs never draw: `CreateWindowExW` creates a
+`GuestWindow` record, `ShowWindow` publishes it to the manager, and `DwmCompositor.Sync()` turns
+the immutable `WindowSnapshot` list into XAML `Border`/`Grid`/`TextBlock`/`Button` trees.  Child
+`STATIC`/`BUTTON` classes become App controls.  Input is inverted: the compositor hit-tests the
+virtual screen, updates key state, and posts `WM_*` messages into the owning guest thread's
+queue.  `GetMessageW` blocks on that queue and `DispatchMessageW` invokes the guest wndproc
+through the normal `ImaginedThread.InvokeGuest` path, so re-entrant `WM_CREATE`-style callbacks
+work.  `DefWindowProcW` owns the default close/destroy/title/hit-test behaviour.
+
+GDI is out of scope.  The guest can create, size, show, focus and title windows, and receive
+input, but the client area is composed by XAML rather than guest pixels.  The native sample
+`samples/window/window.c` exercises this path; there is no Host CLI equivalent because the
+compositor is a UI feature.

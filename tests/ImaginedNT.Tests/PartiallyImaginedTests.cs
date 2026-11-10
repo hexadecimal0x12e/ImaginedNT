@@ -69,7 +69,10 @@ internal static class PartiallyImaginedTests
                     Assert.Equal(named, runtime.ResolveExport(process, mapped.BaseAddress, null, 1), "ordinal alias");
                     Assert.Equal((uint)process.Id, Call(process, named), "dynamic replacement");
                     runtime.Options.ImportPolicy = ImportPolicy.ManagedOnly;
-                    Assert.Equal(0UL, runtime.ResolveExport(process, mapped.BaseAddress, "Tiny"), "managed-only blocks native part");
+                    // Guest-mapped exports are guest code, not host native forwards; they remain
+                    // callable under managed-only/strict policy (see ResolveMappedExport).
+                    Assert.NotEqual(0UL, runtime.ResolveExport(process, mapped.BaseAddress, "Tiny"),
+                        "guest export remains callable under managed-only");
                     Assert.Equal(named, runtime.ResolveExport(process, mapped.BaseAddress, "Replace"), "managed part remains available");
                     runtime.Options.ImportPolicy = policy;
                 }

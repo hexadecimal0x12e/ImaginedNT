@@ -29,7 +29,7 @@ internal static class NativeApiDeclarationTests
     private static void BuiltinCrtDeclarations()
     {
         using var runtime = BuiltinApis.CreateRuntime(RuntimeOptions.ForTests());
-        Assert.Equal(348, runtime.NativeDeclarations.Count, "built-in CRT declaration count");
+        Assert.Equal(355, runtime.NativeDeclarations.Count, "built-in CRT declaration count");
         Assert.True(runtime.NativeDeclarations.IsDeclared("api-ms-win-crt-math-l1-1-0.dll", "sin"),
             "API-set declaration");
         Assert.True(runtime.NativeDeclarations.IsDeclared("ucrtbase", "sin"), "backing-DLL alias");
