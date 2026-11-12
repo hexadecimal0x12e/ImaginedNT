@@ -42,8 +42,9 @@ internal sealed class GdiSurface : IDisposable
         var previous = GdiNative.SelectObject(Dc, bitmap);
         if (previous == 0 || previous == -1)
         {
+            var error = Marshal.GetLastPInvokeError();
             GdiNative.DeleteObject(bitmap);
-            throw new Win32Exception();
+            throw new Win32Exception(error, $"SelectObject failed while resizing GDI surface to {width}x{height} (dc=0x{Dc:X}, bitmap=0x{bitmap:X}).");
         }
         if (_bitmap == 0) _original = previous;
         else GdiNative.DeleteObject(_bitmap);
@@ -106,7 +107,7 @@ internal static class GdiNative
 
     [DllImport("gdi32.dll", SetLastError = true)] internal static extern nint CreateCompatibleDC(nint dc);
     [DllImport("gdi32.dll", SetLastError = true)] internal static extern nint CreateDIBSection(nint dc, ref BitmapInfo info, uint usage, out nint bits, nint section, uint offset);
-    [DllImport("gdi32.dll")] internal static extern nint SelectObject(nint dc, nint obj);
+    [DllImport("gdi32.dll", SetLastError = true)] internal static extern nint SelectObject(nint dc, nint obj);
     [DllImport("gdi32.dll")] internal static extern bool DeleteObject(nint obj);
     [DllImport("gdi32.dll")] internal static extern bool DeleteDC(nint dc);
     [DllImport("gdi32.dll")] internal static extern bool GdiFlush();

@@ -111,7 +111,8 @@ internal sealed class GdiDrawing(WindowManager windows) : IWindowDrawing, IDispo
     {
         lock (_gate)
         {
-            if (GetSurface(hwnd) is not { } state) return;
+            // UI invalidation must not replace a bitmap while the guest is drawing into its DC.
+            if (_disposed || !_surfaces.TryGetValue(hwnd, out var state)) return;
             state.Invalid = true;
             state.Erase |= erase;
         }

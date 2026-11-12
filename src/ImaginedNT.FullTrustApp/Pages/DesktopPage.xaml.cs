@@ -85,5 +85,20 @@ public sealed partial class DesktopPage : Page
         return true;
     }
 
-    internal void Sync() => Compositor.Sync();
+    private void OnManageStations(object sender, RoutedEventArgs args) => AppRuntime.Navigate("stations");
+
+    private void OnFollowInput(object sender, RoutedEventArgs args)
+    {
+        _session?.Windows.ViewDesktop(null);
+        Sync();
+    }
+
+    internal void Sync()
+    {
+        var desktop = _session?.Windows.DisplayDesktop;
+        DesktopTitle.Text = desktop is null ? "来宾窗口桌面" :
+            $"会话 {desktop.SessionId} · {desktop.WindowStation.Name}\\{desktop.Name}";
+        FollowInputButton.IsEnabled = _session is not null;
+        Compositor.Sync();
+    }
 }

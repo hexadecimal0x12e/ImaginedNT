@@ -291,6 +291,8 @@ Anything not in the managed list is resolved through `NativeForwarder` under the
 - API-set names (`api-ms-win-*`, `ext-ms-win-*`) map to the classic modules.
 - Ordinal imports and forwarded exports use the host's `GetProcAddress`.
 - `--strict` / `managed-only` disables this fallback and fails the load on an unresolved import.
+- `--no-native-fallback` disables undeclared native fallback while keeping native forwards
+  declared with `[PartiallyImaginedNativeApi]`; runtime implementations always take priority.
 - `--native-declared-only` (or `--native-policy declared-only`) keeps native forwarding but only
   for exports declared with `[NativeApi]`. The built-in CRT declaration set is in
   `ImaginedNT.Apis.Crt/CrtNativeApis.cs`; undeclared or ordinal imports are rejected.

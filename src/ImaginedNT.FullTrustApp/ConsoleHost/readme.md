@@ -8,7 +8,7 @@ pwsh -File src/ImaginedNT.FullTrustApp/ConsoleHost/build.ps1
 
 生成 `ConsoleHost/bin/conhost.exe`。需要 MSVC x64 工具和 Windows SDK，可设置 `IMAGINEDNT_VCVARS` 指向 `vcvars64.bat`。
 
-启动后自动运行 `C:\Windows\System32\cmd.exe /D /Q /A`，隐藏其控制台窗口。通过匿名管道发送输入，接收合并的标准输出和错误流；回车提交整行，输入后台写入。关闭窗口时终止仍在运行的 cmd。cmd 退出后保留输出供查看。
+启动后自动运行 `C:\Windows\System32\cmd.exe /D /A`，隐藏其控制台窗口。通过匿名管道发送输入，接收合并的标准输出和错误流；回车提交整行，输入后台写入。关闭窗口时终止仍在运行的 cmd。cmd 退出后保留输出供查看。
 
 管道文本按系统 OEM 代码页转码，保留跨读取的多字节字符；不自动跟随 `chcp` 或外部程序自行切换的输出编码。
 

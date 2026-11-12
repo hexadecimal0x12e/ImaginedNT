@@ -78,7 +78,10 @@ public sealed record WindowSnapshot(
     uint BackgroundArgb,
     uint ForegroundArgb,
     int ZOrder,
-    int ControlId);
+    int ControlId)
+{
+    public ImaginedNT.Core.Runtime.DesktopObject Desktop { get; init; } = null!;
+}
 
 /// <summary>Window class registered by RegisterClassExW/A or one of the built-in classes.</summary>
 internal sealed class WindowClassInfo
@@ -97,6 +100,8 @@ internal sealed class WindowClassInfo
 /// <summary>One guest-visible window (top-level or child).</summary>
 internal sealed class GuestWindow
 {
+    public required ImaginedNT.Core.Runtime.ImaginedThread Thread { get; init; }
+    public required ImaginedNT.Core.Runtime.DesktopObject Desktop { get; init; }
     public required ulong Handle { get; init; }
     public required int ProcessId { get; init; }
     public required int ThreadId { get; init; }
@@ -119,6 +124,7 @@ internal sealed class GuestWindow
     public bool Enabled { get; set; } = true;
     public bool Minimized { get; set; }
     public bool Maximized { get; set; }
+    public GuiRect? RestoreRect { get; set; }
     public int ZOrder { get; set; }
     public int ControlId => (int)(Menu & 0xFFFF);
     public List<GuestWindow> Children { get; } = new();
@@ -141,10 +147,14 @@ internal static class WindowGeometry
     public static GuiRect Client(GuestWindow window, GuiRect outer)
     {
         if (window.IsChild) return outer;
-        var top = window.HasCaption ? CaptionHeight + BorderWidth : BorderWidth;
-        return new(outer.X + BorderWidth, outer.Y + top,
-            Math.Max(0, window.Width - BorderWidth * 2),
-            Math.Max(0, window.Height - top - BorderWidth));
+        var border = BorderWidth;
+#if FULL_TRUST_APP
+        if ((window.Style & (Win32.WS_BORDER | Win32.WS_DLGFRAME | Win32.WS_THICKFRAME)) == 0) border = 0;
+#endif
+        var top = window.HasCaption ? CaptionHeight + border : border;
+        return new(outer.X + border, outer.Y + top,
+            Math.Max(0, window.Width - border * 2),
+            Math.Max(0, window.Height - top - border));
     }
 }
 

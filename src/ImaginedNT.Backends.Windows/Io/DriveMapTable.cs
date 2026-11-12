@@ -12,6 +12,7 @@ public sealed class DriveMapTable
     private sealed record RuleSet(Dictionary<FileOperation, FileRule> Permissions, bool? Excluded = null);
     private sealed record Entry(string Pattern, RuleSet Rules, List<Entry> Children);
     private readonly List<Entry> _entries;
+    private readonly List<string> _includedPaths = [];
     private readonly RuleSet _defaults;
     private readonly bool _inherit;
     public VirtualDriveOptions Options { get; }
@@ -89,6 +90,17 @@ public sealed class DriveMapTable
             return entries;
         }
         _entries = fields.TryGetValue("FS", out var fs) ? Entries(fs) : [];
+        void CollectIncluded(List<Entry> entries, string prefix)
+        {
+            foreach (var e in entries)
+            {
+                var path = e.Pattern == "<self>" ? prefix :
+                    (prefix.Length == 0 ? "" : prefix + "\\") + (e.Pattern == "<left>" ? "*" : e.Pattern);
+                if (e.Rules.Excluded == false && path.Length != 0) _includedPaths.Add(path);
+                CollectIncluded(e.Children, path);
+            }
+        }
+        CollectIncluded(_entries, "");
     }
 
     public static DriveMapTable Load(string path)
@@ -130,7 +142,32 @@ public sealed class DriveMapTable
     private bool IsExcluded(string relative)
     {
         _ = Resolve(relative, FileOperation.Enum, out var excluded);
-        return excluded;
+        return excluded && !HasVisibleDescendants(relative);
+    }
+
+    public bool HasVisibleDescendants(string relative)
+    {
+        string[] parent = relative.Length == 0 ? [] : relative.Replace('/', '\\').Split('\\');
+        foreach (var path in _includedPaths)
+        {
+            var parts = path.Replace('/', '\\').Split('\\');
+            var visited = new HashSet<(int, int)>();
+            bool Below(int p, int r)
+            {
+                if (!visited.Add((p, r))) return false;
+                if (p == parts.Length) return false;
+                if (r == parent.Length)
+                {
+                    var candidate = (relative.Length == 0 ? "" : relative + "\\") + string.Join("\\", parts[p..]);
+                    _ = Resolve(candidate, FileOperation.Enum, out var excluded);
+                    return !excluded;
+                }
+                if (parts[p] == "**") return Below(p + 1, r) || Below(p, r + 1);
+                return Matches(parts[p], parent[r]) && Below(p + 1, r + 1);
+            }
+            if (Below(0, 0)) return true;
+        }
+        return false;
     }
 
     public (FileRule Rule, string Suffix) Resolve(string relative, FileOperation operation) => Resolve(relative, operation, out _);

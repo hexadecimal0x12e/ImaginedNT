@@ -29,7 +29,6 @@ internal static class VirtualEnvironment
             ["PROCESSOR_LEVEL"] = "42",
             ["PROCESSOR_REVISION"] = RuntimeInformation.FrameworkDescription,
             ["NUMBER_OF_PROCESSORS"] = Environment.ProcessorCount.ToString(),
-            ["USERNAME"] = "void",
             ["USERDOMAIN"] = "ImaginedMachine",
             ["USERDNSDOMAIN"] = "ImaginedMachine.local",
             ["COMPUTERNAME"] = "ImaginedMachine",

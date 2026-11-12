@@ -13,6 +13,7 @@ internal sealed class HostSession : IAsyncDisposable
     private readonly TerminalOutput _output = new();
     private readonly TraceLog _log;
     private Task<ProcessExitInfo>? _run;
+    private readonly TaskCompletionSource<ProcessExitInfo> _idle = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private Task<ImaginedProcess>? _insert;
     private Task? _stop;
     private bool _disposed;
@@ -41,6 +42,7 @@ internal sealed class HostSession : IAsyncDisposable
     public Task<ProcessExitInfo> RunAsync(string image, string arguments)
     {
         if (_run is not null) throw new InvalidOperationException("此会话已经启动。");
+        if (!Runtime.Options.ExecuteImage) return _run = _idle.Task;
         if (!File.Exists(image)) throw new FileNotFoundException("未找到来宾程序。", image);
         var guestImage = GetGuestImagePath(image);
         _run = Task.Run(() =>
@@ -49,7 +51,8 @@ internal sealed class HostSession : IAsyncDisposable
             try
             {
                 process.LoadImage(image);
-                _log.Info($"host started: pid={process.Id}, image={image}");
+                _log.Info($"host started: pid={process.Id}, image={image}"); 
+                new WindowsSimulation.ImaginedSMSS().Start(Runtime, new ProcessCreateOptions { ImagePath = @"c:\windows\system32\smss.exe", CurrentDirectory = @"c:\" });
                 return process.Run();
             }
             catch
@@ -73,19 +76,22 @@ internal sealed class HostSession : IAsyncDisposable
             ? "C:\\" + relative.Replace('/', '\\') : "C:\\" + Path.GetFileName(image);
     }
 
-    public Task<ImaginedProcess> StartProcessAsync(string image)
+    public Task<ImaginedProcess> StartProcessAsync(string image, DesktopObject? desktop = null, string arguments = "")
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_stop is not null) throw new InvalidOperationException("此会话正在停止。");
         if (_insert is { IsCompleted: false }) throw new InvalidOperationException("正在添加进程。");
+        if (desktop is not null && !Runtime.WindowStations.Contains(desktop)) throw new ArgumentException("桌面不存在或已被删除。");
         return _insert = Task.Run(() =>
         {
             var process = Runtime.CreateProcess(new ProcessCreateOptions
             {
                 ImagePath = image,
-                CommandLine = $"\"{GetGuestImagePath(image)}\"",
+                CommandLine = $"\"{GetGuestImagePath(image)}\" {arguments}".TrimEnd(),
                 CurrentDirectory = "C:\\",
                 ParentId = null,
+                SessionId = desktop?.SessionId,
+                Desktop = desktop is null ? null : $"{desktop.WindowStation.Name}\\{desktop.Name}",
                 IsRoot = false
             });
             try
@@ -108,6 +114,7 @@ internal sealed class HostSession : IAsyncDisposable
     private async Task StopCoreAsync()
     {
         _input.Complete();
+        _idle.TrySetResult(new ProcessExitInfo(0, false, TimeSpan.Zero));
         if (_insert is not null)
             try { await _insert; }
             catch (Exception ex) { _log.Error($"inserted guest failed: {ex}"); }

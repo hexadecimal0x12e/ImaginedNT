@@ -168,7 +168,7 @@ internal sealed class WmiRecord(Dictionary<string, object?> values)
             ["Name"] = p.Name, ["Caption"] = p.Name,
             ["Description"] = p.Name, ["ExecutablePath"] = p.ImagePath,
             ["CommandLine"] = p.CommandLine, ["Handle"] = p.Id.ToString(CultureInfo.InvariantCulture),
-            ["ProcessId"] = (uint)p.Id, ["ParentProcessId"] = (uint)p.ParentId, ["SessionId"] = 0u,
+            ["ProcessId"] = (uint)p.Id, ["ParentProcessId"] = (uint)p.ParentId, ["SessionId"] = p.SessionId,
             ["WorkingSetSize"] = m.Process.WorkingSetSize, ["PeakWorkingSetSize"] = m.Process.PeakWorkingSetSize / 1024,
             ["VirtualSize"] = m.VirtualBytes, ["PrivatePageCount"] = m.Process.PrivateUsage,
             ["PageFileUsage"] = m.Process.PagefileUsage / 1024, ["HandleCount"] = (uint)p.HandleCount,

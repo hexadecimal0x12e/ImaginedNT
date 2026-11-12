@@ -27,6 +27,7 @@ internal static class AppRuntime
     public static bool IsStopping { get; private set; }
     public static bool CanConfigure => Session is null && !IsClosed && !IsStopping;
     public static bool IsRunning => Session is not null && !IsClosed && !IsStopping;
+    public static event Action<string>? BugChecked;
     public static event Action? Changed;
     public static event Action<string>? NavigationRequested;
 
@@ -117,12 +118,13 @@ internal static class AppRuntime
             }
             EnsureSamples();
             var fs = new SandboxFileSystem(options.SandboxRoot!, options.AllowFileWrites, drives: options.Drives);
-            var image = Path.IsPathFullyQualified(imagePath) ? Path.GetFullPath(imagePath)
+            var image = !options.ExecuteImage ? "" : Path.IsPathFullyQualified(imagePath) ? Path.GetFullPath(imagePath)
                 : DriveYaml.ContainsKey('C') ? fs.MapPath(imagePath, "C:\\", FileOperation.Execute)
                 : Path.GetFullPath(imagePath, SandboxRoot);
             session = new HostSession(options, Log);
+            session.Runtime.BugChecked += message => BugChecked?.Invoke(message);
             Session = session;
-            Status = $"运行中 · {Path.GetFileName(image)}";
+            Status = options.ExecuteImage ? $"运行中 · {Path.GetFileName(image)}" : "环境运行中";
             Changed?.Invoke();
             var exit = await session.RunAsync(image, arguments);
             if (ReferenceEquals(Session, session) && !IsClosed)

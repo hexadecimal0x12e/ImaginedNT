@@ -83,7 +83,7 @@ All imagined processes share the host address space, but their allocation accoun
 The reported working set and private commit both represent accounted guest committed memory;
 unmodeled page faults and kernel-pool counters are zero. These are allocation admission budgets,
 not an OS physical-page quota: unmediated native allocations are not tracked. Guest allocation
-and reporting APIs remain managed under native-first policy. `LimitJobObject` is the separate host-wide OS
+and reporting APIs always use the runtime implementation. `LimitJobObject` is the separate host-wide OS
 commit backstop. `HeapReAlloc` checks net growth and leaves the old allocation charged on failure.
 
 The memory layouts and counter meanings follow Microsoft's

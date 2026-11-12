@@ -197,7 +197,8 @@ public static class SystemApis
         }
 
         thread.Thread.Terminate(exitCode);
-        thread.Thread.Process.OnMainThreadExited(thread.Thread);
+        if (!thread.Thread.Process.IsImaginedProcess)
+            thread.Thread.Process.OnMainThreadExited(thread.Thread);
     }
 
     [VirtualApi("kernel32.dll", "TerminateThread", ApiCategory.Thread)]
@@ -550,7 +551,7 @@ public static class SystemApis
         if (string.IsNullOrEmpty(value)) return BoolResult(ctx, false, Win32Error.InvalidParameter);
         try
         {
-            var host = ctx.Process.FileSystem.MapPath(value, ctx.Process.CurrentDirectory);
+            var host = ctx.Process.FileSystem.MapPath(value, ctx.Process.CurrentDirectory, FileOperation.Enum);
             if (!HostFileSystem.DirectoryExists(host))
             {
                 ctx.Runtime.Trace.Warn($"SetCurrentDirectoryW('{value}') failed: current='{ctx.Process.CurrentDirectory}', host='{host}'",
@@ -615,7 +616,10 @@ public static class SystemApis
         name = ctx.Runtime.ResolveLibraryName(name);
         var managed = ctx.Process.FindModuleByName(name);
         if (managed is not null) return managed.BaseAddress;
-        if (ctx.Runtime.Apis.IsPartiallyImagined(name) || ctx.Runtime.FindImportedLibrary(name) is not null)
+        if (ctx.Runtime.FindImportedLibrary(name) is not null || ctx.Runtime.IsDllRedirectPath(name) ||
+            (ctx.Runtime.Apis.IsPartiallyImagined(name) &&
+                (!ImaginedRuntime.IsHostSystemModule(name) ||
+                    ApiRegistry.NormalizeModule(name) is "msvcrt" or "ucrtbase")))
         {
             ctx.SetLastError(126);
             return 0;

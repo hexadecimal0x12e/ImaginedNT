@@ -171,13 +171,12 @@ exception never unwinds through the guest's unannotated native frames.
 
 ## 5. Import policy
 
-`ImaginedRuntime.ResolveImport` implements three policies:
+`ImaginedRuntime.ResolveImport` implements two policies:
 
 | Policy | Behaviour |
 |---|---|
-| `ManagedFirst` (default) | Managed implementation if registered; otherwise native export; otherwise fail-thunk |
+| `ManagedFirst` (default) | Runtime implementation if registered; otherwise declared native export or enabled native fallback; otherwise fail-thunk |
 | `ManagedOnly` (`--strict`) | Managed only; unresolved imports fail the load |
-| `NativeFirst` | Native export preferred; managed fallback if the host lacks the export |
 
 Module names are normalized (case-insensitive, `.dll` optional) and API-set imports
 (`api-ms-win-*`, `ext-ms-win-*`) are mapped to the classic `kernel32`/`ntdll` registrations.
@@ -353,9 +352,10 @@ exports that are themselves forwarders still work. Modules stay loaded for the h
 
 An API assembly may also declare native exports with assembly-level `[NativeApi]` attributes.
 These declarations are collected by `NativeApiScanner` into `ImaginedRuntime.NativeDeclarations`
-and do not create a managed handler. The default `NativeApiPolicy.AllowAll` preserves the classic
-forward-anything behavior; `NativeApiPolicy.DeclaredOnly` permits native forwarding only for
-declared module/name pairs. The built-in CRT declaration set is
+and do not create a managed handler. Registered runtime implementations always take priority.
+`AllowUnimplementedApiForwarding` defaults to `true`; disabling it keeps declared native forwards
+while blocking undeclared fallback (`--no-native-fallback`). `NativeApiPolicy.DeclaredOnly`
+also restricts forwarding to declared module/name pairs. The built-in CRT declaration set is
 `ImaginedNT.Apis.Crt/CrtNativeApis.cs` (346 safe-native UCRT exports, each with a `ucrtbase!name`
 alias). Ordinal-only imports are denied under `DeclaredOnly` because they have no auditable name.
 This is an import-resolution policy, not a security boundary: arbitrary guest machine code can
@@ -386,7 +386,7 @@ callbacks could still reference it is not safe in this in-process model.
 
 `PartiallyImaginedApiAttribute` derives from `VirtualApiAttribute` and is discovered by the same
 scanner. Its registrations set `ApiRegistration.IsPartiallyImagined`; these exports always use
-the managed implementation, including under `NativeFirst`. Other exports retain the native code
+the managed implementation. Other exports retain the native code
 in the guest mapping and follow the normal forwarding policy. Partial modules use exact module
 lookup instead of inheriting similarly named APIs from unrelated DLLs.
 

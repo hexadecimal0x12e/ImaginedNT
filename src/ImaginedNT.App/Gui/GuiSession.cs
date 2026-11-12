@@ -17,6 +17,7 @@ internal sealed class GuiSession(RuntimeOptions options, TraceLog log)
     private ImaginedRuntime? _runtime;
     private WindowManager? _windows;
     private Task<ProcessExitInfo>? _run;
+    private readonly TaskCompletionSource<ProcessExitInfo> _idle = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private volatile bool _stopping;
 
     public ImaginedRuntime? Runtime => Volatile.Read(ref _runtime);
@@ -38,6 +39,7 @@ internal sealed class GuiSession(RuntimeOptions options, TraceLog log)
         Volatile.Write(ref _runtime, runtime);
         Volatile.Write(ref _windows, windows);
 
+        if (!options.ExecuteImage) return _run = _idle.Task;
         var image = Path.Combine(_sandboxRoot, imageName);
         _run = Task.Run(() =>
         {
@@ -68,6 +70,7 @@ internal sealed class GuiSession(RuntimeOptions options, TraceLog log)
     {
         if (_stopping) return;
         _stopping = true;
+        _idle.TrySetResult(new ProcessExitInfo(0, false, TimeSpan.Zero));
         // Waking the message queues first lets a guest parked in GetMessageW unwind normally.
         Windows?.CloseAll();
         try

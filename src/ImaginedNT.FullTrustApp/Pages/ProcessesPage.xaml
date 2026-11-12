@@ -13,7 +13,25 @@
             <ColumnDefinition Width="3*" />
         </Grid.ColumnDefinitions>
         <Button x:Name="AddProcessButton" Grid.ColumnSpan="2" Content="添加进程" Click="OnAddProcessClicked" IsEnabled="False" />
-        <ListView Grid.Row="1" x:Name="ProcessList" SelectionChanged="OnProcessSelected" />
+        <ListView Grid.Row="1" x:Name="ProcessList" SelectionChanged="OnProcessSelected">
+            <ListView.ItemContainerStyle>
+                <Style TargetType="ListViewItem">
+                    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                </Style>
+            </ListView.ItemContainerStyle>
+            <ListView.ItemTemplate>
+                <DataTemplate>
+                    <Grid ColumnSpacing="12" Padding="0,4">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="{Binding Summary}" TextWrapping="Wrap" VerticalAlignment="Center" />
+                        <Button Grid.Column="1" Content="结束进程" Tag="{Binding Process}" IsEnabled="{Binding CanTerminate}" Click="OnTerminateProcessClicked" VerticalAlignment="Center" />
+                    </Grid>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+        </ListView>
         <TextBox Grid.Row="1" Grid.Column="1" x:Name="ProcessDetails" IsReadOnly="True" AcceptsReturn="True" FontFamily="Consolas" TextWrapping="Wrap" Header="进程详情 · 线程 / 模块 / 句柄 / 内存" ScrollViewer.VerticalScrollBarVisibility="Auto" />
     </Grid>
 </Page>

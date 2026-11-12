@@ -23,7 +23,7 @@ public static class WindowApis
     {
         handle = ctx.Arg(argument);
         var manager = Manager(ctx);
-        return manager.TryGetWindow(handle, out window) && window is not null;
+        return manager.TryGetWindow(handle, out window) && window is not null && window.Desktop == ctx.Thread.Desktop;
     }
 
     // --- class registration -----------------------------------------------------
@@ -163,6 +163,12 @@ public static class WindowApis
             : ansi ? ctx.ReadAnsiString(titlePointer)
             : ctx.ReadUnicodeString(titlePointer);
 
+        if (ctx.Thread.DesktopHandle != 0 && !ctx.TryGetObject(ctx.Thread.DesktopHandle, out _, 2))
+        {
+            ctx.SetLastError(Win32Error.AccessDenied);
+            return 0;
+        }
+
         var window = manager.CreateWindow(ctx.Process.Id, ctx.Thread.Id, windowClass, title, style, exStyle,
             x, y, width, height, parent, menu, instance);
         if (window is null)
@@ -211,6 +217,13 @@ public static class WindowApis
             if (createStructAddress != 0) ctx.Process.Heap.Free(createStructAddress, ctx.Thread.Id);
         }
 
+        if ((style & (Win32.WS_MAXIMIZE | Win32.WS_MINIMIZE)) != 0)
+        {
+            var visible = window.Visible;
+            if ((style & Win32.WS_MAXIMIZE) != 0) manager.ShowWindow(window.Handle, Win32.SW_SHOWMAXIMIZED);
+            if ((style & Win32.WS_MINIMIZE) != 0) manager.ShowWindow(window.Handle, Win32.SW_SHOWMINIMIZED);
+            manager.SetVisible(window.Handle, visible);
+        }
         if ((style & Win32.WS_VISIBLE) != 0)
             SendCore(ctx, manager, window.Handle, Win32.WM_SHOWWINDOW, 1, 0);
         return window.Handle;
@@ -276,6 +289,7 @@ public static class WindowApis
     {
         if (handle == 0) return 0;
         if (!manager.TryGetWindow(handle, out var window) || window is null) return 0;
+        if (window.Desktop != ctx.Thread.Desktop) { ctx.SetLastError(Win32Error.AccessDenied); return 0; }
         var wndProc = window.WndProc;
         if (wndProc != 0 && ctx.Thread.IsManagedHosted && !ctx.Process.IsTerminating)
         {
@@ -326,9 +340,22 @@ public static class WindowApis
                 DestroyWindowCore(ctx, manager, handle);
                 return 0;
             case Win32.WM_SYSCOMMAND:
-                if ((wParam & 0xFFF0) == Win32.SC_CLOSE)
+                switch (wParam & 0xFFF0)
                 {
-                    DestroyWindowCore(ctx, manager, handle);
+                    case Win32.SC_CLOSE:
+                        SendCore(ctx, manager, handle, Win32.WM_CLOSE, 0, 0);
+                        break;
+                    case Win32.SC_MINIMIZE:
+                        if ((window.Style & Win32.WS_MINIMIZEBOX) != 0)
+                            manager.ShowWindow(handle, Win32.SW_MINIMIZE);
+                        break;
+                    case Win32.SC_MAXIMIZE:
+                        if ((window.Style & Win32.WS_MAXIMIZEBOX) != 0)
+                            manager.ShowWindow(handle, Win32.SW_SHOWMAXIMIZED);
+                        break;
+                    case Win32.SC_RESTORE:
+                        manager.ShowWindow(handle, Win32.SW_RESTORE);
+                        break;
                 }
                 return 0;
             case Win32.WM_SETTEXT:
@@ -385,11 +412,8 @@ public static class WindowApis
         }
         var previous = manager.IsVisible(handle);
         var visible = command != Win32.SW_HIDE;
-        manager.SetVisible(handle, visible);
+        manager.ShowWindow(handle, command);
         SendCore(ctx, manager, handle, Win32.WM_SHOWWINDOW, visible ? 1UL : 0UL, 0);
-        if (visible && command is Win32.SW_SHOWMAXIMIZED)
-            SendCore(ctx, manager, handle, Win32.WM_SIZE, Win32.SIZE_MAXIMIZED,
-                Win32.MakeSize(window.Width, window.Height));
         return previous ? 1UL : 0UL;
     }
 
@@ -686,7 +710,7 @@ public static class WindowApis
 
     [VirtualApi("user32.dll", "IsWindow", ApiCategory.Gui)]
     private static ulong IsWindow(ApiCallContext ctx) =>
-        Manager(ctx).TryGetWindow(ctx.Arg(0), out _) ? 1UL : 0UL;
+        Manager(ctx).TryGetWindow(ctx.Arg(0), out _) || Manager(ctx).IsDesktopWindow(ctx.Arg(0)) ? 1UL : 0UL;
 
     [VirtualApi("user32.dll", "IsWindowVisible", ApiCategory.Gui)]
     private static ulong IsWindowVisible(ApiCallContext ctx) =>
@@ -722,7 +746,45 @@ public static class WindowApis
             className = ansi ? ctx.ReadAnsiString(classPointer) : ctx.ReadUnicodeString(classPointer);
         string? title = titlePointer == 0 ? null
             : ansi ? ctx.ReadAnsiString(titlePointer) : ctx.ReadUnicodeString(titlePointer);
-        return Manager(ctx).FindWindow(className, title)?.Handle ?? 0;
+        return Manager(ctx).FindWindow(className, title, ctx.Thread.Desktop)?.Handle ?? 0;
+    }
+
+    [VirtualApi("user32.dll", "EnumDesktopWindows", ApiCategory.Gui)]
+    private static ulong EnumDesktopWindows(ApiCallContext ctx)
+    {
+        var desktop = ctx.Thread.Desktop;
+        if (ctx.Arg(0) != 0)
+        {
+            if (!ctx.TryGetObject(ctx.Arg(0), out var obj, 0x40) || obj is not DesktopObject d || d.IsDisposed)
+            {
+                ctx.SetLastError(Win32Error.InvalidHandle);
+                return 0;
+            }
+            if (d.SessionId != ctx.Process.SessionId)
+            {
+                ctx.SetLastError(Win32Error.AccessDenied);
+                return 0;
+            }
+            desktop = d;
+        }
+        return EnumerateWindows(ctx, Manager(ctx).GetDesktopWindows(desktop), 1);
+    }
+
+    [VirtualApi("user32.dll", "EnumWindows", ApiCategory.Gui)]
+    private static ulong EnumWindows(ApiCallContext ctx) =>
+        EnumerateWindows(ctx, Manager(ctx).GetDesktopWindows(ctx.Thread.Desktop), 0);
+
+    [VirtualApi("user32.dll", "EnumThreadWindows", ApiCategory.Gui)]
+    private static ulong EnumThreadWindows(ApiCallContext ctx) =>
+        EnumerateWindows(ctx, Manager(ctx).GetDesktopWindows(ctx.Thread.Desktop, ctx.ArgInt32(0)), 1);
+
+    private static ulong EnumerateWindows(ApiCallContext ctx, ulong[] windows, int callbackIndex)
+    {
+        if (ctx.Arg(callbackIndex) == 0) { ctx.SetLastError(Win32Error.InvalidParameter); return 0; }
+        foreach (var handle in windows)
+            if (Manager(ctx).TryGetWindow(handle, out _) &&
+                (uint)ctx.Thread.InvokeGuest(ctx.Arg(callbackIndex), [handle, ctx.Arg(callbackIndex + 1)]) == 0) return 0;
+        return 1;
     }
 
     [VirtualApi("user32.dll", "GetParent", ApiCategory.Gui)]
@@ -741,40 +803,40 @@ public static class WindowApis
     }
 
     [VirtualApi("user32.dll", "GetForegroundWindow", ApiCategory.Gui)]
-    private static ulong GetForegroundWindow(ApiCallContext ctx) => Manager(ctx).ForegroundWindow;
+    private static ulong GetForegroundWindow(ApiCallContext ctx) => Manager(ctx).GetDesktopFocus(ctx.Thread.Desktop).Foreground;
 
     [VirtualApi("user32.dll", "SetForegroundWindow", ApiCategory.Gui)]
     private static ulong SetForegroundWindow(ApiCallContext ctx)
     {
         var manager = Manager(ctx);
-        if (!manager.TryGetWindow(ctx.Arg(0), out _)) return 0;
+        if (!manager.TryGetWindow(ctx.Arg(0), out var window) || window?.Desktop != ctx.Thread.Desktop) return 0;
         manager.Activate(ctx.Arg(0));
         return 1;
     }
 
     [VirtualApi("user32.dll", "GetActiveWindow", ApiCategory.Gui)]
-    private static ulong GetActiveWindow(ApiCallContext ctx) => Manager(ctx).ForegroundWindow;
+    private static ulong GetActiveWindow(ApiCallContext ctx) => Manager(ctx).GetDesktopFocus(ctx.Thread.Desktop).Foreground;
 
     [VirtualApi("user32.dll", "SetActiveWindow", ApiCategory.Gui)]
     private static ulong SetActiveWindow(ApiCallContext ctx)
     {
         var manager = Manager(ctx);
-        var previous = manager.ForegroundWindow;
-        if (!manager.TryGetWindow(ctx.Arg(0), out _)) return previous;
+        var previous = manager.GetDesktopFocus(ctx.Thread.Desktop).Foreground;
+        if (!manager.TryGetWindow(ctx.Arg(0), out var window) || window?.Desktop != ctx.Thread.Desktop) return previous;
         manager.Activate(ctx.Arg(0));
         return previous;
     }
 
     [VirtualApi("user32.dll", "GetFocus", ApiCategory.Gui)]
-    private static ulong GetFocus(ApiCallContext ctx) => Manager(ctx).FocusWindow;
+    private static ulong GetFocus(ApiCallContext ctx) => Manager(ctx).GetDesktopFocus(ctx.Thread.Desktop).Focus;
 
     [VirtualApi("user32.dll", "SetFocus", ApiCategory.Gui)]
     private static ulong SetFocus(ApiCallContext ctx)
     {
         var manager = Manager(ctx);
-        var previous = manager.FocusWindow;
-        if (ctx.Arg(0) != 0 && !manager.TryGetWindow(ctx.Arg(0), out _)) return previous;
-        manager.SetFocus(ctx.Arg(0));
+        var previous = manager.GetDesktopFocus(ctx.Thread.Desktop).Focus;
+        if (ctx.Arg(0) != 0 && (!manager.TryGetWindow(ctx.Arg(0), out var window) || window?.Desktop != ctx.Thread.Desktop)) return previous;
+        manager.SetFocus(ctx.Arg(0), ctx.Thread.Desktop);
         return previous;
     }
 
@@ -788,7 +850,7 @@ public static class WindowApis
     }
 
     [VirtualApi("user32.dll", "GetDesktopWindow", ApiCategory.Gui)]
-    private static ulong GetDesktopWindow(ApiCallContext ctx) => 0;
+    private static ulong GetDesktopWindow(ApiCallContext ctx) => Manager(ctx).GetDesktopWindow(ctx.Thread.Desktop);
 
     [VirtualApi("user32.dll", "GetWindowThreadProcessId", ApiCategory.Gui)]
     private static ulong GetWindowThreadProcessId(ApiCallContext ctx)
@@ -877,6 +939,17 @@ public static class WindowApis
         var lParam = ctx.Arg(3);
         if (handle == 0)
             return manager.PostThreadMessage(ctx.Thread.Id, message, wParam, unchecked((long)lParam)) ? 1UL : 0UL;
+        if (handle == 0xFFFF)
+        {
+            foreach (var hwnd in manager.GetDesktopWindows(ctx.Thread.Desktop))
+                manager.PostMessage(hwnd, message, wParam, unchecked((long)lParam));
+            return 1;
+        }
+        if (!manager.TryGetWindow(handle, out var window) || window?.Desktop != ctx.Thread.Desktop)
+        {
+            ctx.SetLastError(Win32Error.AccessDenied);
+            return 0;
+        }
         return manager.PostMessage(handle, message, wParam, unchecked((long)lParam)) ? 1UL : 0UL;
     }
 
@@ -890,6 +963,9 @@ public static class WindowApis
     {
         var threadId = unchecked((int)ctx.Arg32(0));
         if (threadId == 0) return 0;
+        var target = ctx.Runtime.Processes.Where(p => p.SessionId == ctx.Process.SessionId)
+            .SelectMany(p => p.Threads).FirstOrDefault(t => t.Id == threadId);
+        if (target is null || target.Desktop != ctx.Thread.Desktop) { ctx.SetLastError(Win32Error.AccessDenied); return 0; }
         return Manager(ctx).PostThreadMessage(threadId, ctx.Arg32(1), ctx.Arg(2),
             unchecked((long)ctx.Arg(3))) ? 1UL : 0UL;
     }

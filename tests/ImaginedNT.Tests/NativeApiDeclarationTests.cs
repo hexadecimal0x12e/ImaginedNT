@@ -12,7 +12,7 @@ internal static class NativeApiDeclarationTests
     {
         tests.Add(("Native API declarations discover names and aliases", Discovery));
         tests.Add(("Built-in CRT native declarations load", BuiltinCrtDeclarations));
-        tests.Add(("NativeApiPolicy.DeclaredOnly blocks undeclared native imports", DeclaredOnly));
+        tests.Add(("Disabled native fallback blocks undeclared native imports", DeclaredOnly));
     }
 
     private static void Discovery()
@@ -29,24 +29,26 @@ internal static class NativeApiDeclarationTests
     private static void BuiltinCrtDeclarations()
     {
         using var runtime = BuiltinApis.CreateRuntime(RuntimeOptions.ForTests());
-        Assert.Equal(355, runtime.NativeDeclarations.Count, "built-in CRT declaration count");
+        Assert.Equal(356, runtime.NativeDeclarations.Count, "built-in CRT declaration count");
         Assert.True(runtime.NativeDeclarations.IsDeclared("api-ms-win-crt-math-l1-1-0.dll", "sin"),
             "API-set declaration");
         Assert.True(runtime.NativeDeclarations.IsDeclared("ucrtbase", "sin"), "backing-DLL alias");
+        Assert.True(runtime.NativeDeclarations.IsDeclared("api-ms-win-crt-private-l1-1-0.dll", "__CxxFrameHandler3"),
+            "C++ exception handler declaration");
         Assert.False(runtime.NativeDeclarations.IsDeclared("api-ms-win-crt-stdio-l1-1-0.dll", "fopen"),
             "unsafe export not declared");
     }
 
     private static void DeclaredOnly()
     {
-        foreach (var policy in new[] { ImportPolicy.ManagedFirst, ImportPolicy.NativeFirst })
+        foreach (var policy in new[] { NativeApiPolicy.AllowAll, NativeApiPolicy.DeclaredOnly })
         {
             var options = RuntimeOptions.ForTests();
             options.InterceptSyscalls = false;
-            options.ImportPolicy = policy;
+            options.AllowUnimplementedApiForwarding = false;
             options.AllowNativeForwarding = true;
             options.FailOnUnresolvedImport = true;
-            options.NativeApiPolicy = NativeApiPolicy.DeclaredOnly;
+            options.NativeApiPolicy = policy;
             using var runtime = new ImaginedRuntime(options, new[] { typeof(NativeApiDeclarationTests).Assembly });
 
             Assert.True(runtime.IsNativeForwardingAllowed("api-ms-win-crt-math-l1-1-0.dll", "sin"),

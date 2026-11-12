@@ -13,9 +13,9 @@ namespace ImaginedNT.Core.Runtime;
 /// pure data/arithmetic and safe to forward to <c>ucrtbase</c>.
 /// </para>
 /// <para>
-/// The runtime's default <see cref="NativeApiPolicy.AllowAll"/> ignores these declarations. Set
-/// <see cref="RuntimeOptions.NativeApiPolicy"/> to <see cref="NativeApiPolicy.DeclaredOnly"/> to
-/// allow native forwarding only for declared module/name pairs.
+/// Declared exports remain eligible for native forwarding when
+/// <see cref="RuntimeOptions.AllowUnimplementedApiForwarding"/> is disabled.
+/// Registered managed implementations always take priority.
 /// </para>
 /// </remarks>
 /// <example>

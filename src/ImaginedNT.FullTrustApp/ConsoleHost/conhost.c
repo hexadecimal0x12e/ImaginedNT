@@ -171,7 +171,7 @@ static BOOL StartShell(void)
     static STARTUPINFOW si;
     static PROCESS_INFORMATION pi;
     HANDLE childInput = NULL, childOutput = NULL;
-    static WCHAR command[] = L"\"C:\\Windows\\System32\\cmd.exe\" /D /Q /A";
+    static WCHAR command[] = L"\"C:\\Windows\\System32\\cmd.exe\" /D /A";
     const WCHAR *step = L"CreatePipe(stdin)";
     DWORD error;
     sa.nLength = sizeof(sa);

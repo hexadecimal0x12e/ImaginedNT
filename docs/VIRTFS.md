@@ -14,8 +14,8 @@ CLI 保留 `--drive D=<目录>`，同时接受：
 
 `FS` 是映射节点，规则名称以 `-` 开头；权限表达式用逗号分隔：
 
-- `+read/-read`、`+write/-write`、`+enum/-enum`、`+execute/-execute`、`+delete/-delete`。
-- `exclude` 或 `+exclude` 排除文件或目录；`-exclude` 恢复可见性，可覆盖上级的排除配置。可用于 Default、模板、`<self>`、`<left>` 和路径规则，遵循相同的继承与覆盖顺序。排除的项目不出现在枚举结果中，直接访问返回不存在；恢复可见性后仍须满足原有权限。
+- `+read/-read`、`+write/-write`、`+enum/-enum`、`+execute/-execute`、`+delete/-delete`。属性查询允许使用 `read` 或 `enum` 权限；切换当前目录要求 `enum` 权限。
+- `exclude` 或 `+exclude` 排除文件或目录；`-exclude` 恢复可见性，可覆盖上级的排除配置。可用于 Default、模板、`<self>`、`<left>` 和路径规则，遵循相同的继承与覆盖顺序。排除的项目不出现在枚举结果中，直接访问返回不存在；若后代显式设置了 `-exclude`，且目录具有 `+enum` 权限，则允许列出该目录中可见的项目及通往可见后代的中间目录。枚举仅要求 `enum` 权限，读取内容仍须满足 `read` 权限。
 - `<模板>` 展开 Initials 中的模板；`-<模板>` 反转权限，`<default>` 引用 Default。
 - `<self>` 表示当前目录，`<left>` 表示本层没有命中其他规则的项目。
 - `*` 匹配单层，`**` 跨目录匹配。忽略大小写，先应用通配规则，再应用精确规则；同类按文件顺序覆盖。

@@ -12,29 +12,6 @@ internal static unsafe class NativeHandleBridge
         ApiRegistry.NormalizeModule(module) == "ntdll" &&
         (name.StartsWith("Nt", StringComparison.Ordinal) || name.StartsWith("Zw", StringComparison.Ordinal));
 
-    internal static bool NeedsNative(ApiCallContext ctx)
-    {
-        if (!ctx.Runtime.Options.WrapNativeHandles && !ctx.Runtime.Options.ExpandManagedHandles) return false;
-        if (!(IsNtApi(ctx.Module, ctx.Name)
-            ? NativeApiSignatures.TryGet(ctx.Name, out var signature)
-            : NativeApiSignatures.TryGetWin32(ctx.Module, ctx.Name, out signature))) return false;
-        foreach (var i in signature.HandleArguments)
-            if (NeedsNativeHandle(ctx, ctx.Arg(i))) return true;
-        if (IsMultipleWait(NativeApiSignatures.Normalize(ctx.Name)))
-        {
-            if (ctx.Arg(0) > 64) return false;
-            for (var i = 0; i < (int)ctx.Arg(0); i++)
-                if (NeedsNativeHandle(ctx, ctx.Read<ulong>(ctx.Arg(1) + (ulong)i * 8))) return true;
-        }
-        foreach (var i in signature.ObjectAttributesArguments)
-            if (ctx.Arg(i) != 0 && ctx.Handles.HasNativeRepresentation(ctx.Read<ulong>(ctx.Arg(i) + 8))) return true;
-        return false;
-    }
-
-    private static bool NeedsNativeHandle(ApiCallContext ctx, ulong handle) =>
-        ctx.Handles.HasNativeRepresentation(handle) ||
-        (handle != 0 && handle < unchecked((ulong)-6L) && !ctx.Handles.TryGet(handle, out _));
-
     private static bool IsMultipleWait(string name) =>
         name is "NtWaitForMultipleObjects" or "WaitForMultipleObjects" or "WaitForMultipleObjectsEx";
 

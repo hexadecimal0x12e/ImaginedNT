@@ -8,6 +8,21 @@ using WinRT.Interop;
 
 namespace ImaginedNT.FullTrustApp.Pages;
 
+[Microsoft.UI.Xaml.Data.Bindable]
+public sealed record ProcessRow
+{
+    public ImaginedProcess Process { get; }
+    public string Summary { get; }
+    public bool CanTerminate { get; }
+
+    public ProcessRow(ImaginedProcess process, string summary, bool canTerminate)
+    {
+        Process = process;
+        Summary = summary;
+        CanTerminate = canTerminate;
+    }
+}
+
 public sealed partial class ProcessesPage : Page
 {
     private ImaginedProcess[] _processes = [];
@@ -23,7 +38,23 @@ public sealed partial class ProcessesPage : Page
 
     private void OnUnloaded(object sender, RoutedEventArgs args) => AppRuntime.Changed -= UpdateState;
 
-    private void UpdateState() => AddProcessButton.IsEnabled = AppRuntime.IsRunning && !_adding;
+    private void UpdateState()
+    {
+        AddProcessButton.IsEnabled = AppRuntime.IsRunning && !_adding;
+        ProcessList.IsEnabled = AppRuntime.IsRunning;
+    }
+
+    private void OnTerminateProcessClicked(object sender, RoutedEventArgs args)
+    {
+        if (!AppRuntime.IsRunning || AppRuntime.Session is not { } session || sender is not Button { Tag: ImaginedProcess p }
+            || !ReferenceEquals(p.Runtime, session.Runtime) || p.ExitCode is not null || p.IsTerminating || p.CancellationRequested) return;
+        try
+        {
+            p.Terminate(-1);
+            Refresh();
+        }
+        catch (Exception ex) { AppRuntime.ReportError($"结束进程 {p.Id}", ex); }
+    }
 
     private async void OnAddProcessClicked(object sender, RoutedEventArgs args)
     {
@@ -55,7 +86,10 @@ public sealed partial class ProcessesPage : Page
     {
         var selected = ProcessList.SelectedIndex >= 0 && ProcessList.SelectedIndex < _processes.Length ? _processes[ProcessList.SelectedIndex].Id : -1;
         _processes = AppRuntime.Session?.Runtime.Processes.ToArray() ?? [];
-        PageRows.Set(ProcessList, _processes.Select(p => $"{p.Id}　{Path.GetFileName(p.ImagePath)}　·　{(p.ExitCode is int code ? $"已退出 ({code})" : p.MainThread?.State.ToString() ?? "正在加载")}\n父进程 {p.ParentId?.ToString() ?? "宿主"}　线程 {p.Threads.Count}　句柄 {p.Handles.Count}"));
+        var rows = _processes.Select(p => new ProcessRow(p,
+            $"{p.Id}　{Path.GetFileName(p.ImagePath)}　·　{(p.ExitCode is int code ? $"已退出 ({code})" : p.CancellationRequested ? "正在结束" : p.MainThread?.State.ToString() ?? "正在加载")}\n父进程 {p.ParentId?.ToString() ?? "宿主"}　线程 {p.Threads.Count}　句柄 {p.Handles.Count}",
+            p.ExitCode is null && !p.IsTerminating && !p.CancellationRequested)).ToArray();
+        if (ProcessList.ItemsSource is not ProcessRow[] old || !old.SequenceEqual(rows)) ProcessList.ItemsSource = rows;
         ProcessList.SelectedIndex = _processes.Length == 0 ? -1 : Math.Max(0, Array.FindIndex(_processes, p => p.Id == selected));
         ShowProcessDetails();
     }
@@ -67,10 +101,11 @@ public sealed partial class ProcessesPage : Page
         var p = _processes[ProcessList.SelectedIndex];
         var regions = p.Memory.Regions;
         var text = new StringBuilder().AppendLine($"PID: {p.Id}    {p.MainThread?.State}")
+            .AppendLine($"会话: {p.SessionId}    窗口站: {p.WindowStation.Name}    启动桌面: {p.StartupDesktop.Name}")
             .AppendLine($"映像: {p.ImagePath}").AppendLine($"命令行: {p.CommandLine}")
             .AppendLine($"工作目录: {p.CurrentDirectory}").AppendLine($"启动时间: {p.StartTime:yyyy-MM-dd HH:mm:ss}")
             .AppendLine($"已跟踪内存: {regions.Sum(r => (double)r.RegionSize) / 1048576:0.00} MiB").AppendLine("\n线程");
-        foreach (var t in p.Threads) text.AppendLine($"  {t.Id} native={t.NativeId} {t.State} {t.Name} exit={t.ExitCode?.ToString() ?? "-"}");
+        foreach (var t in p.Threads) text.AppendLine($"  {t.Id} native={t.NativeId} {t.State} {t.Name} desktop={t.Desktop.WindowStation.Name}\\{t.Desktop.Name} exit={t.ExitCode?.ToString() ?? "-"}");
         text.AppendLine("\n模块");
         foreach (var m in p.LoadedModules) text.AppendLine($"  {m.Image.FileName} 0x{m.BaseAddress:X16} {m.SizeOfImage:N0} B");
         text.AppendLine("\n句柄");

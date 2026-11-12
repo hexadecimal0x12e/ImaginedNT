@@ -34,9 +34,12 @@ public sealed class ImaginedThread : IDisposable
     private int _terminationRequested;
     private int _terminationExitCode;
     private volatile bool _exitRequested;
+    private readonly Func<ImaginedProcessContext, CancellationToken, Task<int>>? _entryPoint;
+    private readonly CancellationTokenSource? _cancellation;
 
     internal ImaginedThread(ImaginedProcess process, int id, uint nativeId, IntPtr handle, ulong startAddress, ulong parameter,
-        bool isMain, string name, bool managedHosted = false)
+        bool isMain, string name, bool managedHosted = false,
+        Func<ImaginedProcessContext, CancellationToken, Task<int>>? entryPoint = null)
     {
         Process = process;
         Id = id;
@@ -47,6 +50,8 @@ public sealed class ImaginedThread : IDisposable
         IsMain = isMain;
         Name = name;
         _managedHosted = managedHosted;
+        _entryPoint = entryPoint;
+        if (entryPoint is not null) _cancellation = new CancellationTokenSource();
 
         if (managedHosted)
         {
@@ -55,13 +60,16 @@ public sealed class ImaginedThread : IDisposable
                 IsBackground = true,
                 Name = $"imagined-p{process.Id}-t{id}"
             };
-            _launcherContext = Marshal.AllocHGlobal(sizeof(ulong));
-            Marshal.WriteInt64(_launcherContext, 0);
-            _exitTrampolineAddress = process.Runtime.Thunks.AllocateThreadExitTrampoline((ulong)_launcherContext);
-            if (_exitTrampolineAddress == 0)
+            if (entryPoint is null)
             {
-                Marshal.FreeHGlobal(_launcherContext);
-                throw new InvalidOperationException("guest thread exit trampoline allocation failed");
+                _launcherContext = Marshal.AllocHGlobal(sizeof(ulong));
+                Marshal.WriteInt64(_launcherContext, 0);
+                _exitTrampolineAddress = process.Runtime.Thunks.AllocateThreadExitTrampoline((ulong)_launcherContext);
+                if (_exitTrampolineAddress == 0)
+                {
+                    Marshal.FreeHGlobal(_launcherContext);
+                    throw new InvalidOperationException("guest thread exit trampoline allocation failed");
+                }
             }
             State = ThreadState.Created;
             Suspended = true;
@@ -73,6 +81,9 @@ public sealed class ImaginedThread : IDisposable
     }
 
     public ImaginedProcess Process { get; }
+    private DesktopObject? _desktop;
+    public DesktopObject Desktop { get => _desktop ?? Process.StartupDesktop; internal set => _desktop = value; }
+    public ulong DesktopHandle { get; internal set; }
     public int Id { get; }
     public uint NativeId { get; internal set; }
     public ulong StartAddress { get; }
@@ -89,6 +100,7 @@ public sealed class ImaginedThread : IDisposable
 
     /// <summary>True when this guest thread is executed by a System.Threading.Thread.</summary>
     public bool IsManagedHosted => _managedHosted;
+    internal bool IsImaginedEntry => _entryPoint is not null;
 
     /// <summary>Unmanaged stub that unwinds the guest frame back into the managed thread body.</summary>
     public ulong ExitTrampolineAddress => _exitTrampolineAddress;
@@ -121,8 +133,11 @@ public sealed class ImaginedThread : IDisposable
     public bool Start()
     {
         if (!_managedHosted || _managedThread is null) return false;
-        if (Volatile.Read(ref _finished) != 0) return false;
-        if (Interlocked.CompareExchange(ref _started, 1, 0) != 0) return false;
+        lock (_gate)
+        {
+            if (IsFinished || IsImaginedEntry && TerminationRequested) return false;
+            if (Interlocked.CompareExchange(ref _started, 1, 0) != 0) return false;
+        }
         try
         {
             _managedThread.Start();
@@ -136,7 +151,8 @@ public sealed class ImaginedThread : IDisposable
         catch (Exception ex)
         {
             Process.Trace.Error($"managed guest thread {Id} failed to start: {ex.GetType().Name}: {ex.Message}", Process.Id, Id);
-            MarkExited(-1, ThreadState.Terminated);
+            if (IsImaginedEntry) Complete(-1, ThreadState.Terminated);
+            else MarkExited(-1, ThreadState.Terminated);
             return false;
         }
     }
@@ -226,6 +242,7 @@ public sealed class ImaginedThread : IDisposable
             ExitCode ??= exitCode;
             State = state;
         }
+        Process.Runtime.OnThreadExited(this);
         _exitedSignal.Set();
         Process.DetachThread(this);
     }
@@ -248,6 +265,18 @@ public sealed class ImaginedThread : IDisposable
 
     internal void RequestTermination(int exitCode)
     {
+        if (IsImaginedEntry)
+        {
+            lock (_gate)
+            {
+                if (_terminationRequested != 0 || IsFinished) return;
+                _terminationExitCode = exitCode;
+                Volatile.Write(ref _terminationRequested, 1);
+            }
+            CancelEntry();
+            if (!HasStarted) Complete(exitCode, ThreadState.Terminated);
+            return;
+        }
         Interlocked.Exchange(ref _terminationExitCode, exitCode);
         Volatile.Write(ref _terminationRequested, 1);
         if (!HasStarted) MarkExited(exitCode, ThreadState.Terminated);
@@ -284,13 +313,21 @@ public sealed class ImaginedThread : IDisposable
         ulong* args = stackalloc ulong[16];
         new Span<ulong>(args, 16).Clear();
         arguments.CopyTo(new Span<ulong>(args, 16));
+        ulong* faultInfo = stackalloc ulong[2];
+        faultInfo[0] = faultInfo[1] = 0;
         var previous = *(ulong*)_launcherContext;
         int? lastError = null;
         try
         {
-            var launcher = (delegate* unmanaged<ulong, ulong*, ulong*, ulong>)(nint)Process.Runtime.Thunks.LauncherAddress;
-            var result = launcher(address, args, (ulong*)_launcherContext);
+            var launcher = (delegate* unmanaged<ulong, ulong*, ulong*, ulong*, ulong>)(nint)Process.Runtime.Thunks.LauncherAddress;
+            var result = launcher(address, args, (ulong*)_launcherContext, faultInfo);
             lastError = NativeMethods.GetLastError();
+            if (faultInfo[0] != 0)
+            {
+                Process.Trace.Error($"unhandled guest C++ exception 0x{faultInfo[0]:X8} at 0x{faultInfo[1]:X16}; stopping virtual process", Process.Id, Id);
+                Process.Terminate(unchecked((int)faultInfo[0]));
+                throw new GuestProcessFaultException(unchecked((int)faultInfo[0]));
+            }
             if (Process.FaultExitCode is int code) throw new GuestProcessFaultException(code);
             if (HasRequestedExit && !exiting) throw new GuestThreadExitException(ReadExitCode() ?? Process.ExitCode ??
                 (TerminationRequested ? TerminationExitCode : unchecked((int)result)));
@@ -319,6 +356,13 @@ public sealed class ImaginedThread : IDisposable
 
         try
         {
+            if (_entryPoint is not null)
+            {
+                Process.Runtime.SetImaginedThread(this);
+                var exitCode = _entryPoint(new ImaginedProcessContext(this), _cancellation!.Token).GetAwaiter().GetResult();
+                Complete(exitCode, ThreadState.Exited);
+                return;
+            }
             if (IsMain)
             {
                 // The Windows loader runs the main image's TLS callbacks before DLL DllMains.
@@ -336,16 +380,32 @@ public sealed class ImaginedThread : IDisposable
         }
         catch (GuestThreadExitException ex)
         {
-            CompleteFromGuest(ex.ExitCode);
+            if (IsImaginedEntry) Complete(ex.ExitCode, ThreadState.Exited);
+            else CompleteFromGuest(ex.ExitCode);
+        }
+        catch (OperationCanceledException) when (_cancellation?.IsCancellationRequested == true)
+        {
+            Complete(TerminationExitCode, ThreadState.Terminated);
         }
         catch (Exception ex)
         {
-            Process.Trace.Error($"guest thread {Id} terminated with {ex.GetType().Name}: {ex.Message}", Process.Id, Id);
+            Process.Trace.Error($"guest thread {Id} terminated: {ex}", Process.Id, Id);
             Complete(TerminationRequested ? TerminationExitCode : -1, ThreadState.Terminated);
         }
         finally
         {
+            if (IsImaginedEntry) Process.Runtime.SetImaginedThread(null);
             Process.DetachThread(this);
+            if (IsImaginedEntry && Process.DisposalRequested)
+                ThreadPool.QueueUserWorkItem(state =>
+                {
+                    try
+                    {
+                        Wait(Timeout.InfiniteTimeSpan, out _);
+                        Process.Dispose();
+                    }
+                    catch (Exception ex) { Process.Trace.Error($"imagined process cleanup failed: {ex}", Process.Id, Id); }
+                });
         }
     }
 
@@ -369,6 +429,7 @@ public sealed class ImaginedThread : IDisposable
 
     private void Complete(int exitCode, ThreadState state)
     {
+        if (IsImaginedEntry) CancelEntry();
         if (IsMain)
         {
             lock (_gate) ExitCode ??= exitCode;
@@ -376,6 +437,12 @@ public sealed class ImaginedThread : IDisposable
             Process.OnMainThreadExited(this);
         }
         MarkExited(exitCode, state);
+    }
+
+    private void CancelEntry()
+    {
+        try { _cancellation!.Cancel(); }
+        catch (Exception ex) { Process.Trace.Error($"imagined process cancellation failed: {ex}", Process.Id, Id); }
     }
 
     internal ulong GetTlsValue(int slot)

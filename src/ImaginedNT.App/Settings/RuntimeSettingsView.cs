@@ -5,6 +5,7 @@ using ImaginedNT.Core.Diagnostics;
 using ImaginedNT.Core.Io;
 using ImaginedNT.Core.Runtime;
 #if FULL_TRUST_APP
+using CommunityToolkit.WinUI.Controls;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 #else
@@ -20,6 +21,7 @@ internal sealed class RuntimeSettingsView : UserControl
     private readonly TraceLog _log;
     private readonly Func<Dictionary<char, string>> _getPaths;
     private readonly StackPanel _panel = new() { Spacing = 12, MaxWidth = 800, HorizontalAlignment = HorizontalAlignment.Left };
+    private readonly StackPanel _options = new() { Spacing = 12 };
     private readonly StackPanel _volumes = new() { Spacing = 12 };
     private readonly TextBlock _status = new() { TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true };
     private readonly TextBlock _root = new() { TextWrapping = TextWrapping.Wrap };
@@ -33,7 +35,15 @@ internal sealed class RuntimeSettingsView : UserControl
         _settings = settings;
         _log = log;
         _getPaths = getPaths;
+#if FULL_TRUST_APP
+        HorizontalContentAlignment = HorizontalAlignment.Stretch;
+        _panel.MaxWidth = double.PositiveInfinity;
+        _panel.HorizontalAlignment = HorizontalAlignment.Stretch;
+        _panel.Spacing = _options.Spacing = _volumes.Spacing = 4;
+        Content = _panel;
+#else
         Content = new ScrollViewer { Content = _panel, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+#endif
         _panel.Children.Add(new TextBlock { Text = "保存后在下次启动 shell 或窗口程序时生效。", TextWrapping = TextWrapping.Wrap });
         var actions = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 8 };
         var save = new Button { Content = "保存设置" };
@@ -49,17 +59,22 @@ internal sealed class RuntimeSettingsView : UserControl
         _panel.Children.Add(actions);
         _panel.Children.Add(_status);
         _panel.Children.Add(new TextBlock { Text = "标准输入、输出、错误流、诊断输出目标及本机转发器工厂由宿主会话提供。", TextWrapping = TextWrapping.Wrap });
-        _panel.Children.Add(_root);
         var sandbox = new Button { Content = "配置沙盒目录和驱动器…" };
         sandbox.Click += (_, _) => openSandbox();
+#if FULL_TRUST_APP
+        _panel.Children.Add(new SettingsCard { Header = "沙盒目录与驱动器", Description = _root, Content = sandbox });
+#else
+        _panel.Children.Add(_root);
         _panel.Children.Add(sandbox);
+#endif
+        _panel.Children.Add(_options);
         Build(_settings.Options);
         _status.Text = _settings.LoadError ?? "";
     }
 
     private void Build(RuntimeOptions options)
     {
-        while (_panel.Children.Count > 6) _panel.Children.RemoveAt(6);
+        _options.Children.Clear();
         _fields.Clear();
         _packageFields.Clear();
         _status.Text = "";
@@ -74,11 +89,11 @@ internal sealed class RuntimeSettingsView : UserControl
             if (group != info.Group)
             {
                 group = info.Group;
-                AddHeading(_panel, group);
+                AddHeading(_options, group);
             }
-            _fields.Add((p, AddEditor(_panel, p, p.GetValue(options), info.Label, info.Hint)));
+            _fields.Add((p, AddEditor(_options, p, p.GetValue(options), info.Label, info.Hint)));
         }
-        AddHeading(_panel, "模拟包身份");
+        AddHeading(_options, "模拟包身份");
         foreach (var p in typeof(PackageIdentity).GetProperties().Where(p => p.CanWrite))
         {
             var label = p.Name switch
@@ -87,10 +102,10 @@ internal sealed class RuntimeSettingsView : UserControl
                 "Version" => "包版本（四段版本号）", "Architecture" => "架构（x86 / x64 / arm / arm64 / neutral）",
                 "ResourceId" => "资源 ID", "InstallPath" => "来宾安装路径", "ApplicationId" => "应用 ID", _ => p.Name
             };
-            _packageFields.Add((p, AddEditor(_panel, p, p.GetValue(options.PackageIdentity), label, "")));
+            _packageFields.Add((p, AddEditor(_options, p, p.GetValue(options.PackageIdentity), label, "")));
         }
-        AddHeading(_panel, "驱动器卷信息");
-        _panel.Children.Add(_volumes);
+        AddHeading(_options, "驱动器卷信息");
+        _options.Children.Add(_volumes);
         BuildDrives(options);
     }
 
@@ -129,23 +144,41 @@ internal sealed class RuntimeSettingsView : UserControl
 
     private static void AddHeading(StackPanel panel, string text) => panel.Children.Add(new TextBlock
     {
+#if FULL_TRUST_APP
+        Text = text, Style = (Style)Application.Current.Resources["BodyStrongTextBlockStyle"],
+        Margin = new Thickness(0, 24, 0, 4), TextWrapping = TextWrapping.Wrap
+#else
         Text = text, FontSize = 20, Margin = new Thickness(0, 16, 0, 0), TextWrapping = TextWrapping.Wrap
+#endif
     });
 
     private static Func<object?> AddEditor(StackPanel panel, PropertyInfo p, object? value, string label, string hint)
     {
         var title = $"{label} · {p.Name}";
+        FrameworkElement editor;
         Func<object?> read;
         if (p.PropertyType == typeof(bool))
         {
+#if FULL_TRUST_APP
+            var toggle = new ToggleSwitch { IsOn = value is true };
+            editor = toggle;
+            read = () => toggle.IsOn;
+#else
             var check = new CheckBox { Content = title, IsChecked = (bool?)value };
-            panel.Children.Add(check);
+            editor = check;
             read = () => check.IsChecked == true;
+#endif
         }
         else if (p.PropertyType.IsEnum)
         {
-            var combo = new ComboBox { Header = title, ItemsSource = Enum.GetValues(p.PropertyType), SelectedItem = value, MinWidth = 260 };
-            panel.Children.Add(combo);
+            var combo = new ComboBox
+            {
+#if !FULL_TRUST_APP
+                Header = title,
+#endif
+                ItemsSource = Enum.GetValues(p.PropertyType), SelectedItem = value, MinWidth = 260
+            };
+            editor = combo;
             read = () => combo.SelectedItem ?? throw new ArgumentException($"请选择{label}。");
         }
         else
@@ -154,7 +187,10 @@ internal sealed class RuntimeSettingsView : UserControl
             var collection = p.Name is nameof(RuntimeOptions.DllRedirects) or nameof(RuntimeOptions.ComServerPaths);
             var text = new TextBox
             {
-                Header = title, HorizontalAlignment = HorizontalAlignment.Stretch, MinWidth = 260,
+#if !FULL_TRUST_APP
+                Header = title,
+#endif
+                HorizontalAlignment = HorizontalAlignment.Stretch, MinWidth = 260,
                 Text = value switch
                 {
                     TimeSpan timeout => timeout == Timeout.InfiniteTimeSpan ? "-1" : timeout.TotalSeconds.ToString(CultureInfo.InvariantCulture),
@@ -165,7 +201,7 @@ internal sealed class RuntimeSettingsView : UserControl
                 AcceptsReturn = collection, TextWrapping = collection ? TextWrapping.Wrap : TextWrapping.NoWrap,
                 MaxHeight = collection ? 240 : double.PositiveInfinity
             };
-            panel.Children.Add(text);
+            editor = text;
             read = () =>
             {
                 try
@@ -193,7 +229,18 @@ internal sealed class RuntimeSettingsView : UserControl
                 catch (Exception ex) { throw new ArgumentException($"{label}（{p.Name}）：{ex.Message}", ex); }
             };
         }
+#if FULL_TRUST_APP
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(editor, title);
+        panel.Children.Add(new SettingsCard
+        {
+            Header = title, Description = hint, Content = editor,
+            ContentAlignment = editor is TextBox ? ContentAlignment.Vertical : ContentAlignment.Right,
+            HorizontalContentAlignment = HorizontalAlignment.Stretch
+        });
+#else
+        panel.Children.Add(editor);
         if (hint.Length > 0) panel.Children.Add(new TextBlock { Text = hint, TextWrapping = TextWrapping.Wrap, Opacity = 0.7 });
+#endif
         return read;
     }
 
@@ -235,7 +282,7 @@ internal sealed class RuntimeSettingsView : UserControl
     private static (string Group, string Label, string Hint) Describe(string name) => name switch
     {
         "IsPackaged" => ("运行与身份", "模拟 MSIX 包身份", "包身份字段在下方配置。"),
-        "ExecuteImage" => ("运行与身份", "执行来宾映像", "当前运行路径尚未使用此开关。"),
+        "ExecuteImage" => ("运行与身份", "执行来宾映像", "关闭时仅初始化环境，由持有方手动创建和启动进程。"),
         "InterceptSyscalls" => ("运行与身份", "拦截直接系统调用", "修补映像中的直接系统调用指令。"),
         "TerminationMode" => ("运行与身份", "根进程退出方式", "ThreadExit：仅退出线程；HostExit：退出整个应用；ReturnToHost：返回来宾代码，仅供测试。"),
         "ExecutionTimeout" => ("运行与身份", "执行超时（秒）", "-1 表示无限；超时后终止来宾进程线程。"),
@@ -243,12 +290,13 @@ internal sealed class RuntimeSettingsView : UserControl
         "SimulatedWindowsVersion" => ("运行与身份", "模拟 Windows 版本", "留空使用宿主版本，例如 10.0.19045.0。"),
         "CopyrightText" => ("运行与身份", "版权文本", "留空使用宿主结果。"),
         "ProductName" => ("运行与身份", "产品名称", "留空按模拟 Windows 版本选择默认名称。"),
-        "ImportPolicy" => ("DLL 与本机 API", "导入解析策略", "ManagedFirst：托管优先；ManagedOnly：仅托管；NativeFirst：本机优先。"),
+        "ImportPolicy" => ("DLL 与本机 API", "导入解析策略", "ManagedFirst：运行时实现优先；ManagedOnly：仅托管。"),
         "DllRedirects" => ("DLL 与本机 API", "DLL 重定向（JSON）", "例如 {\"example.dll\": \"replacement.dll\"}，目标也可使用宿主完整路径。"),
         "ComServerPaths" => ("DLL 与本机 API", "COM 服务器 DLL 路径", "每行一个来宾沙盒路径或宿主路径。"),
         "FailOnUnresolvedImport" => ("DLL 与本机 API", "未解析导入时加载失败", "关闭时生成返回入口点未找到状态的占位函数。"),
         "AllowNativeForwarding" => ("DLL 与本机 API", "允许本机 API 转发", "仍受导入解析策略约束。"),
-        "NativeApiPolicy" => ("DLL 与本机 API", "本机转发声明策略", "AllowAll：所有可解析导出；DeclaredOnly：仅已声明导出。"),
+        "AllowUnimplementedApiForwarding" => ("DLL 与本机 API", "未实现 API 的本机保底转发", "默认开启；关闭后仅允许 Partially Imagined 声明的本机转发。"),
+        "NativeApiPolicy" => ("DLL 与本机 API", "本机转发声明策略", "AllowAll：允许启用未实现 API 保底转发；DeclaredOnly：仅已声明导出。"),
         "WrapNativeHandles" => ("DLL 与本机 API", "包装本机句柄为来宾句柄", ""),
         "ExpandManagedHandles" => ("DLL 与本机 API", "为托管句柄创建本机表示", ""),
         "PreferHostSystemDlls" => ("DLL 与本机 API", "优先使用宿主系统 DLL", "导入系统 DLL 时优先使用宿主 System32 版本。"),

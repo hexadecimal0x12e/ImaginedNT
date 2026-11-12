@@ -18,7 +18,9 @@ public enum ObjectType
     Driver,
     IoCompletion,
     KeyedEvent,
-    Unknown
+    Unknown,
+    WindowStation,
+    Desktop
 }
 
 /// <summary>Base class for every object that can live in the NT object namespace or a handle table.</summary>
@@ -29,6 +31,7 @@ public abstract class NtObject : IDisposable
 
     public abstract ObjectType ObjectType { get; }
     public virtual string TypeName => ObjectType.ToString();
+    public virtual bool IsContainer => ObjectType == ObjectType.Directory;
     public string? Name { get; internal set; }
     public string? FullPath { get; internal set; }
     public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;

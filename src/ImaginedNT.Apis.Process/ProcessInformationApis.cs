@@ -120,10 +120,11 @@ public static class ProcessInformationApis
     [VirtualApi("kernel32.dll", "ProcessIdToSessionId", ApiCategory.Process, "kernelbase!ProcessIdToSessionId")]
     private static ulong ProcessIdToSessionId(ApiCallContext ctx)
     {
-        if (ctx.Runtime.GetProcessInformation(ctx.ArgInt32(0)) is null)
+        var process = ctx.Runtime.GetProcessInformation(ctx.ArgInt32(0));
+        if (process is null)
             return BoolResult(ctx, false, Win32Error.InvalidParameter);
         if (ctx.Arg(1) == 0) return BoolResult(ctx, false, Win32Error.InvalidParameter);
-        ctx.Write(ctx.Arg(1), 0u);
+        ctx.Write(ctx.Arg(1), process.SessionId);
         return 1;
     }
 

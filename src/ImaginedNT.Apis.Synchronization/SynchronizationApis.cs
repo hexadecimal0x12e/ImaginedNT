@@ -66,19 +66,17 @@ public static class SynchronizationApis
         return remaining <= TimeSpan.Zero ? 0 : (uint)Math.Min(remaining.TotalMilliseconds, uint.MaxValue - 1);
     }
 
-    private static string NamedObjectPath(string name) =>
-        name.StartsWith('\\') ? ObjectManager.NormalizePath(name) : ObjectManager.Combine("\\BaseNamedObjects", name);
+    private static string NamedObjectPath(ApiCallContext ctx, string name) => ctx.Process.GetNamedObjectPath(name);
+
+    private static string? ReadObjectName(ApiCallContext ctx, int index) =>
+        ctx.Arg(index) == 0 ? null : ctx.Name.EndsWith('A') ? ctx.ReadAnsiString(ctx.Arg(index)) : ReadUnicodeArg(ctx, index);
 
     private static EventObject? FindEvent(ApiCallContext ctx, string path) => ctx.ObjectManager.Open<EventObject>(path);
     private static MutantObject? FindMutant(ApiCallContext ctx, string path) => ctx.ObjectManager.Open<MutantObject>(path);
     private static SemaphoreObject? FindSemaphore(ApiCallContext ctx, string path) => ctx.ObjectManager.Open<SemaphoreObject>(path);
 
-    private static ulong OpenObjectHandle(ApiCallContext ctx, NtObject obj, uint access = 0x001F_0001)
-    {
-        var handle = ctx.Handles.Create(obj, access);
-        obj.Release();
-        return handle;
-    }
+    private static ulong OpenObjectHandle(ApiCallContext ctx, NtObject obj, uint access = 0x001F_0001) =>
+        ctx.Handles.Create(obj, access);
 
     private static ulong CreateNamedOrOpen<T>(ApiCallContext ctx, string? name, Func<T> factory, out T? result, out uint status)
         where T : NtObject
@@ -93,26 +91,31 @@ public static class SynchronizationApis
             return unnamedHandle;
         }
 
-        var path = NamedObjectPath(name!);
-        var existing = ctx.ObjectManager.Open(path);
-        if (existing is not null)
+        lock (ctx.ObjectManager)
         {
-            if (existing is not T typed)
+            var path = NamedObjectPath(ctx, name!);
+            var existing = ctx.ObjectManager.Open(path);
+            if (existing is not null)
             {
-                status = NtStatus.ObjectTypeMismatch;
-                return 0;
+                if (existing is not T typed)
+                {
+                    status = NtStatus.ObjectTypeMismatch;
+                    return 0;
+                }
+                result = typed;
+                if (ctx.Name.StartsWith("Create", StringComparison.Ordinal)) ctx.SetLastError(Win32Error.AlreadyExists);
+                return OpenObjectHandle(ctx, typed);
             }
-            result = typed;
-            return OpenObjectHandle(ctx, typed);
-        }
 
-        var created = factory();
-        created.Name = name;
-        ctx.ObjectManager.CreateObject(path, created);
-        result = created;
-        var handle = ctx.Handles.Create(created);
-        created.Release();
-        return handle;
+            var created = factory();
+            created.Name = name;
+            ctx.ObjectManager.CreateObject(path, created);
+            result = created;
+            var handle = ctx.Handles.Create(created);
+            created.Release();
+            if (ctx.Name.StartsWith("Create", StringComparison.Ordinal)) ctx.SetLastError(Win32Error.Success);
+            return handle;
+        }
     }
 
     private static ulong OpenNamedHandle<T>(ApiCallContext ctx, ObjectAttributes attributes, out uint status)
@@ -121,7 +124,7 @@ public static class SynchronizationApis
         status = NtStatus.Success;
         var path = attributes.FullPath;
         if (string.IsNullOrEmpty(path) && !string.IsNullOrEmpty(attributes.Name))
-            path = NamedObjectPath(attributes.Name);
+            path = NamedObjectPath(ctx, attributes.Name);
         if (string.IsNullOrEmpty(path))
         {
             status = NtStatus.ObjectNameInvalid;
@@ -156,7 +159,7 @@ public static class SynchronizationApis
         return BoolResult(ctx, result == NtStatus.Success, Win32FromStatus(result));
     }
 
-    [VirtualApi("ntdll.dll", "NtClose", ApiCategory.Object)]
+    [VirtualApi("ntdll.dll", "NtClose", ApiCategory.Object, "ntdll!ZwClose")]
     private static ulong NtClose(ApiCallContext ctx)
     {
         var handle = ctx.Arg(0);
@@ -186,9 +189,10 @@ public static class SynchronizationApis
 
     // --- events ---------------------------------------------------------------------
     [VirtualApi("kernel32.dll", "CreateEventW", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "CreateEventA", ApiCategory.Synchronization)]
     private static ulong CreateEventW(ApiCallContext ctx)
     {
-        var name = ReadUnicodeArg(ctx, 3);
+        var name = ReadObjectName(ctx, 3);
         var manual = ctx.Arg(1) != 0;
         var initial = ctx.Arg(2) != 0;
         var handle = CreateNamedOrOpen(ctx, name, () => new EventObject(manual, initial), out _, out var status);
@@ -201,10 +205,11 @@ public static class SynchronizationApis
     }
 
     [VirtualApi("kernel32.dll", "CreateEventExW", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "CreateEventExA", ApiCategory.Synchronization)]
     private static ulong CreateEventExW(ApiCallContext ctx)
     {
-        var name = ReadUnicodeArg(ctx, 0);
-        var flags = ctx.Arg32(1);
+        var name = ReadObjectName(ctx, 1);
+        var flags = ctx.Arg32(2);
         var manual = (flags & 1) != 0;
         var initial = (flags & 2) != 0;
         var handle = CreateNamedOrOpen(ctx, name, () => new EventObject(manual, initial), out _, out var status);
@@ -217,15 +222,16 @@ public static class SynchronizationApis
     }
 
     [VirtualApi("kernel32.dll", "OpenEventW", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "OpenEventA", ApiCategory.Synchronization)]
     private static ulong OpenEventW(ApiCallContext ctx)
     {
-        var name = ReadUnicodeArg(ctx, 1);
+        var name = ReadObjectName(ctx, 2);
         if (string.IsNullOrEmpty(name))
         {
             ctx.SetLastError(Win32Error.InvalidParameter);
             return 0;
         }
-        var ev = FindEvent(ctx, NamedObjectPath(name));
+        var ev = FindEvent(ctx, NamedObjectPath(ctx, name));
         if (ev is null)
         {
             ctx.SetLastError(Win32Error.FileNotFound);
@@ -258,7 +264,7 @@ public static class SynchronizationApis
         return 1;
     }
 
-    [VirtualApi("ntdll.dll", "NtCreateEvent", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtCreateEvent", ApiCategory.Synchronization, "ntdll!ZwCreateEvent")]
     private static ulong NtCreateEvent(ApiCallContext ctx)
     {
         var handlePtr = ctx.Arg(0);
@@ -271,7 +277,7 @@ public static class SynchronizationApis
         return status;
     }
 
-    [VirtualApi("ntdll.dll", "NtOpenEvent", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtOpenEvent", ApiCategory.Synchronization, "ntdll!ZwOpenEvent")]
     private static ulong NtOpenEvent(ApiCallContext ctx)
     {
         var attrs = ctx.ReadObjectAttributes(ctx.Arg(2));
@@ -280,7 +286,7 @@ public static class SynchronizationApis
         return status;
     }
 
-    [VirtualApi("ntdll.dll", "NtSetEvent", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtSetEvent", ApiCategory.Synchronization, "ntdll!ZwSetEvent")]
     private static ulong NtSetEvent(ApiCallContext ctx)
     {
         if (GetObject(ctx, ctx.Arg(0)) is not EventObject ev) return NtStatus.InvalidHandle;
@@ -289,7 +295,7 @@ public static class SynchronizationApis
         return NtStatus.Success;
     }
 
-    [VirtualApi("ntdll.dll", "NtResetEvent", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtResetEvent", ApiCategory.Synchronization, "ntdll!ZwResetEvent")]
     private static ulong NtResetEvent(ApiCallContext ctx)
     {
         if (GetObject(ctx, ctx.Arg(0)) is not EventObject ev) return NtStatus.InvalidHandle;
@@ -298,7 +304,7 @@ public static class SynchronizationApis
         return NtStatus.Success;
     }
 
-    [VirtualApi("ntdll.dll", "NtPulseEvent", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtPulseEvent", ApiCategory.Synchronization, "ntdll!ZwPulseEvent")]
     private static ulong NtPulseEvent(ApiCallContext ctx)
     {
         if (GetObject(ctx, ctx.Arg(0)) is not EventObject ev) return NtStatus.InvalidHandle;
@@ -309,9 +315,10 @@ public static class SynchronizationApis
 
     // --- mutants --------------------------------------------------------------------
     [VirtualApi("kernel32.dll", "CreateMutexW", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "CreateMutexA", ApiCategory.Synchronization)]
     private static ulong CreateMutexW(ApiCallContext ctx)
     {
-        var name = ReadUnicodeArg(ctx, 2);
+        var name = ReadObjectName(ctx, 2);
         var initialOwner = ctx.Arg(1) != 0;
         var handle = CreateNamedOrOpen(ctx, name, () => new MutantObject(initialOwner, ctx.Thread.Id), out _, out var status);
         if (status != NtStatus.Success)
@@ -323,10 +330,11 @@ public static class SynchronizationApis
     }
 
     [VirtualApi("kernel32.dll", "CreateMutexExW", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "CreateMutexExA", ApiCategory.Synchronization)]
     private static ulong CreateMutexExW(ApiCallContext ctx)
     {
         // CreateMutexExW(attributes, name, flags, desiredAccess); CREATE_MUTEX_INITIAL_OWNER is 1.
-        var name = ReadUnicodeArg(ctx, 1);
+        var name = ReadObjectName(ctx, 1);
         var initialOwner = (ctx.Arg32(2) & 1) != 0;
         var handle = CreateNamedOrOpen(ctx, name, () => new MutantObject(initialOwner, ctx.Thread.Id), out _, out var status);
         if (status != NtStatus.Success)
@@ -338,15 +346,16 @@ public static class SynchronizationApis
     }
 
     [VirtualApi("kernel32.dll", "OpenMutexW", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "OpenMutexA", ApiCategory.Synchronization)]
     private static ulong OpenMutexW(ApiCallContext ctx)
     {
-        var name = ReadUnicodeArg(ctx, 1);
+        var name = ReadObjectName(ctx, 2);
         if (string.IsNullOrEmpty(name))
         {
             ctx.SetLastError(Win32Error.InvalidParameter);
             return 0;
         }
-        var mutant = FindMutant(ctx, NamedObjectPath(name));
+        var mutant = FindMutant(ctx, NamedObjectPath(ctx, name));
         if (mutant is null)
         {
             ctx.SetLastError(Win32Error.FileNotFound);
@@ -364,7 +373,7 @@ public static class SynchronizationApis
         return BoolResult(ctx, status == NtStatus.Success, Win32FromStatus(status));
     }
 
-    [VirtualApi("ntdll.dll", "NtCreateMutant", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtCreateMutant", ApiCategory.Synchronization, "ntdll!ZwCreateMutant")]
     private static ulong NtCreateMutant(ApiCallContext ctx)
     {
         var handlePtr = ctx.Arg(0);
@@ -376,7 +385,7 @@ public static class SynchronizationApis
         return status;
     }
 
-    [VirtualApi("ntdll.dll", "NtOpenMutant", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtOpenMutant", ApiCategory.Synchronization, "ntdll!ZwOpenMutant")]
     private static ulong NtOpenMutant(ApiCallContext ctx)
     {
         var attrs = ctx.ReadObjectAttributes(ctx.Arg(2));
@@ -385,7 +394,7 @@ public static class SynchronizationApis
         return status;
     }
 
-    [VirtualApi("ntdll.dll", "NtReleaseMutant", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtReleaseMutant", ApiCategory.Synchronization, "ntdll!ZwReleaseMutant")]
     private static ulong NtReleaseMutant(ApiCallContext ctx)
     {
         if (GetObject(ctx, ctx.Arg(0)) is not MutantObject mutant) return NtStatus.InvalidHandle;
@@ -397,9 +406,12 @@ public static class SynchronizationApis
 
     // --- semaphores -----------------------------------------------------------------
     [VirtualApi("kernel32.dll", "CreateSemaphoreW", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "CreateSemaphoreA", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "CreateSemaphoreExW", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "CreateSemaphoreExA", ApiCategory.Synchronization)]
     private static ulong CreateSemaphoreW(ApiCallContext ctx)
     {
-        var name = ReadUnicodeArg(ctx, 3);
+        var name = ReadObjectName(ctx, 3);
         var initial = (int)Math.Min(ctx.Arg32(1), int.MaxValue);
         var maximum = (int)Math.Min(ctx.Arg32(2), int.MaxValue);
         if (maximum <= 0) maximum = Math.Max(initial, 1);
@@ -413,15 +425,16 @@ public static class SynchronizationApis
     }
 
     [VirtualApi("kernel32.dll", "OpenSemaphoreW", ApiCategory.Synchronization)]
+    [VirtualApi("kernel32.dll", "OpenSemaphoreA", ApiCategory.Synchronization)]
     private static ulong OpenSemaphoreW(ApiCallContext ctx)
     {
-        var name = ReadUnicodeArg(ctx, 1);
+        var name = ReadObjectName(ctx, 2);
         if (string.IsNullOrEmpty(name))
         {
             ctx.SetLastError(Win32Error.InvalidParameter);
             return 0;
         }
-        var semaphore = FindSemaphore(ctx, NamedObjectPath(name));
+        var semaphore = FindSemaphore(ctx, NamedObjectPath(ctx, name));
         if (semaphore is null)
         {
             ctx.SetLastError(Win32Error.FileNotFound);
@@ -440,7 +453,7 @@ public static class SynchronizationApis
         return BoolResult(ctx, status == NtStatus.Success, Win32FromStatus(status));
     }
 
-    [VirtualApi("ntdll.dll", "NtCreateSemaphore", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtCreateSemaphore", ApiCategory.Synchronization, "ntdll!ZwCreateSemaphore")]
     private static ulong NtCreateSemaphore(ApiCallContext ctx)
     {
         var handlePtr = ctx.Arg(0);
@@ -453,7 +466,7 @@ public static class SynchronizationApis
         return status;
     }
 
-    [VirtualApi("ntdll.dll", "NtOpenSemaphore", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtOpenSemaphore", ApiCategory.Synchronization, "ntdll!ZwOpenSemaphore")]
     private static ulong NtOpenSemaphore(ApiCallContext ctx)
     {
         var attrs = ctx.ReadObjectAttributes(ctx.Arg(2));
@@ -462,7 +475,7 @@ public static class SynchronizationApis
         return status;
     }
 
-    [VirtualApi("ntdll.dll", "NtReleaseSemaphore", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtReleaseSemaphore", ApiCategory.Synchronization, "ntdll!ZwReleaseSemaphore")]
     private static ulong NtReleaseSemaphore(ApiCallContext ctx)
     {
         if (GetObject(ctx, ctx.Arg(0)) is not SemaphoreObject semaphore) return NtStatus.InvalidHandle;
@@ -516,14 +529,14 @@ public static class SynchronizationApis
         return (uint)WaitResult.Timeout;
     }
 
-    [VirtualApi("ntdll.dll", "NtWaitForSingleObject", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtWaitForSingleObject", ApiCategory.Synchronization, "ntdll!ZwWaitForSingleObject")]
     private static ulong NtWaitForSingleObject(ApiCallContext ctx)
     {
         var timeout = TimeoutFromNt(ctx, ctx.Arg(2));
         return WaitForObject(ctx, ctx.Arg(0), timeout);
     }
 
-    [VirtualApi("ntdll.dll", "NtWaitForMultipleObjects", ApiCategory.Synchronization)]
+    [VirtualApi("ntdll.dll", "NtWaitForMultipleObjects", ApiCategory.Synchronization, "ntdll!ZwWaitForMultipleObjects")]
     private static ulong NtWaitForMultipleObjects(ApiCallContext ctx)
     {
         var count = (int)Math.Min(ctx.Arg32(0), 64);
@@ -573,7 +586,7 @@ public static class SynchronizationApis
         return handle;
     }
 
-    [VirtualApi("ntdll.dll", "NtCreateThreadEx", ApiCategory.Thread)]
+    [VirtualApi("ntdll.dll", "NtCreateThreadEx", ApiCategory.Thread, "ntdll!ZwCreateThreadEx")]
     private static ulong NtCreateThreadEx(ApiCallContext ctx)
     {
         var handlePtr = ctx.Arg(0);

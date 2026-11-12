@@ -34,7 +34,7 @@ public sealed class TraceLog : IDisposable
     private readonly object _gate = new();
     private readonly List<TraceEvent> _events = new();
     private readonly TextWriter? _console;
-    private readonly StreamWriter? _file;
+    private StreamWriter? _file;
     private bool _disposed;
 
     public TraceLog(TextWriter? console = null, string? filePath = null)
@@ -104,13 +104,23 @@ public sealed class TraceLog : IDisposable
         }
     }
 
+    /// <summary>Release the log file while allowing late events to remain available in memory.</summary>
+    public void CloseFile()
+    {
+        lock (_gate)
+        {
+            try { _file?.Dispose(); }
+            finally { _file = null; }
+        }
+    }
+
     public void Dispose()
     {
         lock (_gate)
         {
             if (_disposed) return;
             _disposed = true;
-            _file?.Dispose();
+            CloseFile();
         }
     }
 

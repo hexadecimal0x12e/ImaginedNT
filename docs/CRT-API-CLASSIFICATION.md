@@ -76,7 +76,7 @@ Consequences:
 ## 3. What Partially Imagined can and cannot do
 
 `[PartiallyImaginedApi]` replaces an export **entry point**; it is discovered by the same scanner
-as `[VirtualApi]`, always wins over native-first, and patches the guest mapping with an `INT3`
+as `[VirtualApi]`, always uses the runtime implementation, and patches the guest mapping with an `INT3`
 redirector. The hard limits below are properties of the current dispatcher, not of the
 attribute.
 

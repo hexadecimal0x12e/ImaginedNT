@@ -22,12 +22,19 @@ namespace ImaginedNT.Core.Runtime;
 public sealed unsafe class ImaginedRuntime : IDisposable
 {
     private readonly object _gate = new();
+    internal object StateGate => _gate;
     private readonly DateTimeOffset _startTime = DateTimeOffset.UtcNow;
     private readonly List<ImaginedProcess> _processes = new();
+    private readonly Dictionary<uint, SessionInformation> _sessions = new();
+    private uint? _activeConsoleSessionId;
     private int _maximumVirtualPid = ushort.MaxValue;
     private readonly ConcurrentDictionary<uint, ImaginedThread> _threadsByNativeId = new();
+    private readonly AsyncLocal<ImaginedThread?> _imaginedThread = new();
     private int _nextVirtualThreadId = 3;
     private bool _disposed;
+    private int _bugChecked;
+    public bool IsBugChecked => Volatile.Read(ref _bugChecked) != 0;
+    public event Action<string>? BugChecked;
     private readonly HashSet<Assembly> _apiAssemblies = new();
     private readonly Dictionary<string, string> _importedLibraries = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _dllRedirects = new(StringComparer.OrdinalIgnoreCase);
@@ -41,6 +48,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
     public ImaginedRuntime(RuntimeOptions? options = null, IEnumerable<Assembly>? apiAssemblies = null)
     {
         Options = options ?? new RuntimeOptions();
+        if (Options.DefaultSessionId == uint.MaxValue) throw new ArgumentOutOfRangeException(nameof(options), "invalid default session ID");
         foreach (var (source, target) in Options.DllRedirects)
         {
             var key = ApiRegistry.NormalizeModule(source.Trim());
@@ -96,6 +104,10 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         NativeApis = Options.NativeForwarderFactory?.Invoke(Trace) ?? new NativeForwarder(Trace, 0);
         Thunks = new IatThunkAllocator(Trace);
         Objects = new ObjectManager(Trace);
+        WindowStations = new WindowStationManager(this);
+        CreateSession(0, "Services");
+        if (Options.DefaultSessionId != 0) CreateSession(Options.DefaultSessionId, "Console");
+        SetActiveConsoleSession(Options.DefaultSessionId);
         Syscalls = new SyscallDispatcher(this);
         Com = new ComRuntime(this);
         foreach (var server in Options.ComServerPaths) Com.RegisterServer(server);
@@ -118,14 +130,14 @@ public sealed unsafe class ImaginedRuntime : IDisposable
 
         Trace.Emit(TraceKind.Info,
             $"ImaginedNT runtime started: managed APIs={Apis.Count} native declarations={NativeDeclarations.Count} " +
-            $"policy={Options.ImportPolicy} nativePolicy={Options.NativeApiPolicy} termination={Options.TerminationMode} " +
+            $"policy={Options.ImportPolicy} nativePolicy={Options.NativeApiPolicy} nativeFallback={Options.AllowUnimplementedApiForwarding} termination={Options.TerminationMode} " +
             $"hostPid={Environment.ProcessId} systemPid={ProcessInformation.SystemProcessId}");
     }
 
     /// <summary>Register an API assembly before loading or running guest code.</summary>
     public void RegisterApis(Assembly assembly)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
         ArgumentNullException.ThrowIfNull(assembly);
         if (_apiAssemblies.Contains(assembly)) return;
         var managedCount = VirtualApiScanner.Register(assembly, Apis);
@@ -139,7 +151,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
 
     public void RegisterLibrary(string path)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
         var fullPath = Path.GetFullPath(path);
         var image = PeImage.Load(fullPath);
         if (!image.IsDll || !image.Is64Bit || image.Machine != PeMachine.Amd64)
@@ -147,7 +159,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
 
         lock (_gate)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
             var key = ApiRegistry.NormalizeModule(image.FileName);
             if (_importedLibraries.TryGetValue(key, out var existing))
             {
@@ -195,12 +207,86 @@ public sealed unsafe class ImaginedRuntime : IDisposable
     /// <summary>Managed COM subsystem (apartments, class factories, guest vtables, partial forwarding).</summary>
     public ComRuntime Com { get; }
 
-    /// <summary>
-    /// Session-wide NT object namespace shared by every imagined process in this runtime.  Handles
-    /// remain per process; named events/mutants/semaphores created by one process are visible to
-    /// its children, which is what makes cross-process waits useful.
-    /// </summary>
+    /// <summary>运行时对象空间，包含全局对象以及各会话的子目录；句柄表仍归进程所有。</summary>
     public ObjectManager Objects { get; }
+    public WindowStationManager WindowStations { get; }
+
+    public IReadOnlyList<SessionInformation> Sessions
+    {
+        get { lock (_gate) return _sessions.Values.OrderBy(s => s.Id).ToArray(); }
+    }
+
+    public uint? ActiveConsoleSessionId
+    {
+        get { lock (_gate) return _activeConsoleSessionId; }
+    }
+
+    public SessionInformation? GetSession(uint id)
+    {
+        lock (_gate) return _sessions.GetValueOrDefault(id);
+    }
+
+    public SessionInformation CreateSession(uint? sessionId = null, string? name = null)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
+            var id = sessionId ?? 1;
+            if (sessionId is null)
+                while (_sessions.ContainsKey(id) && id < uint.MaxValue) id++;
+            if (id == uint.MaxValue) throw new ArgumentOutOfRangeException(nameof(sessionId));
+            if (_sessions.ContainsKey(id)) throw new InvalidOperationException($"session {id} already exists");
+            var session = new SessionInformation
+            {
+                Id = id, Name = name ?? $"Session-{id}", State = SessionState.Connected
+            };
+            Objects.EnsureDirectory(session.ObjectDirectory);
+            if (id == 0)
+                Objects.CreateSymbolicLink($@"{session.ObjectDirectory}\BaseNamedObjects", session.BaseNamedObjectsPath);
+            else
+                Objects.EnsureDirectory(session.BaseNamedObjectsPath);
+            Objects.CreateSymbolicLink($@"{session.BaseNamedObjectsPath}\Global", @"\BaseNamedObjects");
+            Objects.CreateSymbolicLink($@"{session.BaseNamedObjectsPath}\Local", session.BaseNamedObjectsPath);
+            _sessions.Add(id, session);
+            WindowStations.InitializeSession(id);
+            Trace.Emit(TraceKind.Process, $"created session {id} '{session.Name}'");
+            return session;
+        }
+    }
+
+    public void SetActiveConsoleSession(uint? sessionId)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
+            if (sessionId is uint id && !_sessions.ContainsKey(id))
+                throw new InvalidOperationException($"session {id} does not exist");
+            if (_activeConsoleSessionId == sessionId) return;
+            if (_activeConsoleSessionId is uint previous)
+                _sessions[previous] = _sessions[previous] with { State = SessionState.Disconnected };
+            _activeConsoleSessionId = sessionId;
+            if (sessionId is uint active)
+                _sessions[active] = _sessions[active] with { State = SessionState.Active };
+            Trace.Emit(TraceKind.Process, $"active console session: {sessionId?.ToString() ?? "none"}");
+        }
+    }
+
+    /// <summary>删除已无进程的会话；Session 0 保留到运行时销毁。</summary>
+    public bool DeleteSession(uint id)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
+            if (id == 0 || !_sessions.TryGetValue(id, out var session) || _processes.Any(p => p.SessionId == id))
+                return false;
+            if (_activeConsoleSessionId == id) SetActiveConsoleSession(null);
+            WindowStations.DeleteSession(id);
+            Objects.DeleteTree(session.ObjectDirectory);
+            _sessions.Remove(id);
+            Trace.Emit(TraceKind.Process, $"deleted session {id}");
+            return true;
+        }
+    }
 
     /// <summary>The first (root) imagined process, kept for compatibility with single-process callers.</summary>
     public ImaginedProcess? Process
@@ -254,24 +340,102 @@ public sealed unsafe class ImaginedRuntime : IDisposable
     /// </summary>
     public ImaginedProcess CreateProcess(ProcessCreateOptions options) => CreateProcess(options, null);
 
-    /// <summary>创建来宾进程；非空 processId 指定固定 PID，否则随机分配。</summary>
-    internal ImaginedProcess CreateProcess(ProcessCreateOptions options, int? processId)
+    /// <summary>创建无需 PE 文件的托管进程；通过 EnsureMainThread/Run 启动，入口返回值作为退出码。</summary>
+    public ImaginedProcess CreateImaginedProcess(ProcessCreateOptions options,
+        Func<ImaginedProcessContext, CancellationToken, Task<int>> entryPoint)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(entryPoint);
+        return CreateProcess(options, null, entryPoint);
+    }
+
+    public ImaginedProcess CreateImaginedProcess(ProcessCreateOptions options,
+        Func<ImaginedProcessContext, CancellationToken, int> entryPoint)
+    {
+        ArgumentNullException.ThrowIfNull(entryPoint);
+        return CreateImaginedProcess(options, (context, token) => Task.FromResult(entryPoint(context, token)));
+    }
+
+    /// <summary>创建运行时的托管根进程；必须在创建其他进程前调用。</summary>
+    public ImaginedProcess CreateRootImaginedProcess(ProcessCreateOptions options,
+        Func<ImaginedProcessContext, CancellationToken, Task<int>> entryPoint)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(entryPoint);
+        if (options.ParentId is not null || options.IsRoot == false)
+            throw new ArgumentException("a root process cannot have a parent or IsRoot=false", nameof(options));
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
+            if (_processes.Count != 0)
+                throw new InvalidOperationException("the root process must be created before other processes");
+            return CreateImaginedProcess(options, entryPoint);
+        }
+    }
+
+    public ImaginedProcess CreateRootImaginedProcess(ProcessCreateOptions options,
+        Func<ImaginedProcessContext, CancellationToken, int> entryPoint)
+    {
+        ArgumentNullException.ThrowIfNull(entryPoint);
+        return CreateRootImaginedProcess(options, (context, token) => Task.FromResult(entryPoint(context, token)));
+    }
+
+    /// <summary>创建并启动运行时的托管根进程；入口完成后退出。</summary>
+    public ImaginedProcess StartRootImaginedProcess(ProcessCreateOptions options,
+        Func<ImaginedProcessContext, CancellationToken, Task<int>> entryPoint) =>
+        StartImaginedProcess(CreateRootImaginedProcess(options, entryPoint));
+
+    public ImaginedProcess StartRootImaginedProcess(ProcessCreateOptions options,
+        Func<ImaginedProcessContext, CancellationToken, int> entryPoint)
+    {
+        ArgumentNullException.ThrowIfNull(entryPoint);
+        return StartRootImaginedProcess(options, (context, token) => Task.FromResult(entryPoint(context, token)));
+    }
+
+    /// <summary>创建并启动托管进程；Terminate 只请求取消，入口完成后才退出。</summary>
+    public ImaginedProcess StartImaginedProcess(ProcessCreateOptions options,
+        Func<ImaginedProcessContext, CancellationToken, Task<int>> entryPoint) =>
+        StartImaginedProcess(CreateImaginedProcess(options, entryPoint));
+
+    private static ImaginedProcess StartImaginedProcess(ImaginedProcess process)
+    {
+        if (process.EnsureMainThread(suspended: false).HasStarted) return process;
+        process.Dispose();
+        throw new InvalidOperationException("imagined process entry point could not be started");
+    }
+
+    public ImaginedProcess StartImaginedProcess(ProcessCreateOptions options,
+        Func<ImaginedProcessContext, CancellationToken, int> entryPoint)
+    {
+        ArgumentNullException.ThrowIfNull(entryPoint);
+        return StartImaginedProcess(options, (context, token) => Task.FromResult(entryPoint(context, token)));
+    }
+
+    /// <summary>创建来宾进程；非空 processId 指定固定 PID，否则随机分配。</summary>
+    internal ImaginedProcess CreateProcess(ProcessCreateOptions options, int? processId,
+        Func<ImaginedProcessContext, CancellationToken, Task<int>>? entryPoint = null)
+    {
+        ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
+        ArgumentNullException.ThrowIfNull(options);
         if (processId is <= 0 or ProcessInformation.SystemProcessId)
             throw new ArgumentOutOfRangeException(nameof(processId));
         var fullPath = Path.GetFullPath(options.ImagePath);
-        if (!HostFileSystem.FileExists(fullPath)) throw new FileNotFoundException($"image not found: {fullPath}", fullPath);
+        if (entryPoint is null && !HostFileSystem.FileExists(fullPath))
+            throw new FileNotFoundException($"image not found: {fullPath}", fullPath);
 
         lock (_gate)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
+            ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
             ImaginedProcess? parent = null;
             if (options.ParentId is int parentId)
             {
                 parent = _processes.FirstOrDefault(p => p.Id == parentId)
                          ?? throw new InvalidOperationException($"parent process {parentId} does not exist in this runtime");
             }
+
+            var sessionId = options.SessionId ?? parent?.SessionId ?? Options.DefaultSessionId;
+            var session = _sessions.GetValueOrDefault(sessionId)
+                ?? throw new InvalidOperationException($"session {sessionId} does not exist in this runtime");
+            var desktop = WindowStations.ResolveStartupDesktop(sessionId, parent, options.Desktop);
 
             var pid = processId ?? 0;
             if (processId.HasValue)
@@ -308,7 +472,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             var isRoot = options.IsRoot ?? _processes.Count == 0;
             var commandLine = options.CommandLine ?? $"\"{fullPath}\"";
             var process = new ImaginedProcess(this, pid, fullPath, commandLine, currentDirectory,
-                options.ParentId, sandboxRoot, environment, isRoot);
+                options.ParentId, sandboxRoot, environment, isRoot, session, desktop, entryPoint);
             _processes.Add(process);
             Trace.Emit(TraceKind.Process,
                 $"runtime now owns {_processes.Count} imagined process(es); pid={pid} parent={(options.ParentId?.ToString() ?? "host")}", pid);
@@ -323,6 +487,15 @@ public sealed unsafe class ImaginedRuntime : IDisposable
 
     /// <summary>Raised once when a virtual process signals its exit, before its resources are disposed.</summary>
     public event Action<ImaginedProcess>? ProcessExited;
+    public event Action<ImaginedThread>? ThreadExited;
+
+    internal void OnThreadExited(ImaginedThread thread)
+    {
+        if (ThreadExited is not { } exited) return;
+        foreach (Action<ImaginedThread> handler in exited.GetInvocationList())
+            try { handler(thread); }
+            catch (Exception ex) { Trace.Warn($"thread {thread.Id} exit cleanup failed: {ex}", thread.Process.Id, thread.Id); }
+    }
 
     internal void OnProcessExited(ImaginedProcess process)
     {
@@ -352,12 +525,15 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         _threadsByNativeId.TryGetValue(nativeId, out var thread) ? thread : null;
 
     /// <summary>Resolve the guest thread executing on the current host thread.</summary>
-    public ImaginedThread? GetCurrentThread() => FindThreadByNativeId(Native.NativeMethods.GetCurrentThreadId());
+    public ImaginedThread? GetCurrentThread() => _imaginedThread.Value is { IsFinished: false } thread
+        ? thread : FindThreadByNativeId(Native.NativeMethods.GetCurrentThreadId());
+
+    internal void SetImaginedThread(ImaginedThread? thread) => _imaginedThread.Value = thread;
 
     private ImaginedThread? ResolveThread()
     {
+        if (GetCurrentThread() is { } thread) return thread;
         var nativeId = Native.NativeMethods.GetCurrentThreadId();
-        if (_threadsByNativeId.TryGetValue(nativeId, out var thread)) return thread;
         if (_disposed) return null;
 
         // A callback from a native forwarded API can arrive on a thread the runtime did not
@@ -376,7 +552,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
 
         var message = $"unresolved import {import.ModuleName}!{import.DisplayName} " +
                       $"(policy={Options.ImportPolicy}, nativeForwarding={Options.AllowNativeForwarding}, " +
-                      $"nativeApiPolicy={Options.NativeApiPolicy})";
+                      $"nativeFallback={Options.AllowUnimplementedApiForwarding}, nativeApiPolicy={Options.NativeApiPolicy})";
         if (Options.FailOnUnresolvedImport) throw new BadImageFormatException(message);
         Trace.Warn(message);
         var failThunk = Thunks.Register(frame =>
@@ -407,7 +583,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
     /// </summary>
     public ulong GetManagedApiAddress(string module, string name)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
         if (!Apis.TryGet(module, name, out var registration) || registration is null)
             throw new InvalidOperationException($"managed API is not registered: {module}!{name}");
         return ManagedImport(registration).Address;
@@ -449,10 +625,9 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         {
             foreach (var name in e.Name is null ? new[] { $"#{e.Ordinal}" } : new[] { e.Name, $"#{e.Ordinal}" })
             {
-                if (!Apis.TryGetExact(mapped.Image.FileName, name, out var r) || r is null ||
-                    (!r.IsPartiallyImagined && !IsFailFastApi(r) && !IsVolumeApi(r))) continue;
+                if (!Apis.TryGet(mapped.Image.FileName, name, out var r) || r is null) continue;
                 if (result is not null && result.Handler != r.Handler)
-                    throw new InvalidOperationException($"conflicting Partially Imagined implementations for {mapped.Image.FileName}+0x{export.Rva:X}: {result.Name}, {r.Name}");
+                    throw new InvalidOperationException($"conflicting runtime implementations for {mapped.Image.FileName}+0x{export.Rva:X}: {result.Name}, {r.Name}");
                 result ??= r;
             }
         }
@@ -470,9 +645,9 @@ public sealed unsafe class ImaginedRuntime : IDisposable
                 var registration = FindExportOverride(mapped, export);
                 if (registration is null || export.Forwarder is not null) continue;
                 if (!mapped.Image.Sections.Any(s => s.IsExecutable && s.ContainsRva(export.Rva)))
-                    throw new BadImageFormatException($"{registration.DisplayName}: Partially Imagined requires a function export");
+                    throw new BadImageFormatException($"{registration.DisplayName}: runtime override requires a function export");
                 redirects.Add(mapped.BaseAddress + export.Rva, ManagedImport(registration).Address);
-                Trace.Emit(TraceKind.Import, $"Partially Imagined {registration.DisplayName} at 0x{mapped.BaseAddress + export.Rva:X16}");
+                Trace.Emit(TraceKind.Import, $"managed export {registration.DisplayName} at 0x{mapped.BaseAddress + export.Rva:X16}");
             }
             return redirects;
         }
@@ -489,10 +664,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             ? e.Ordinal == import.Ordinal : e.Name == import.Name);
         var registration = export is null ? null : FindExportOverride(mapped, export);
         if (registration is not null) return ManagedImport(registration);
-        if (Apis.TryGetExact(mapped.Image.FileName, import.DisplayName, out registration) && registration is not null &&
-            (registration.IsPartiallyImagined || IsFailFastApi(registration) ||
-                registration.Category is ApiCategory.Library or ApiCategory.Package or ApiCategory.Com ||
-                IsProcessLocalApi(registration) || Options.ImportPolicy != ImportPolicy.NativeFirst || export is null))
+        if (Apis.TryGet(mapped.Image.FileName, import.DisplayName, out registration) && registration is not null)
             return ManagedImport(registration);
         if (export is null) return null;
         if (export.Forwarder is { } forwarder)
@@ -525,13 +697,6 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         return ImportResolution.Native(WrapNativeImport(import, target), $"guest native {mapped.Image.FileName}!{import.DisplayName}");
     }
 
-    private static bool IsFailFastApi(ApiRegistration registration) => registration.Category == ApiCategory.Process &&
-        registration.Name is "RaiseFailFastException" or "RtlFailFast" or "RtlFailFast2" or
-            "RtlReportCriticalFailure" or "RtlReportFatalFailure" or "FatalAppExitA" or "FatalAppExitW" or
-            "abort" or "terminate" or "_o_abort" or "_o_terminate" or "_invoke_watson" or "_o__invoke_watson" or
-            "_invalid_parameter_noinfo" or "_o__invalid_parameter_noinfo" or
-            "_invalid_parameter_noinfo_noreturn" or "_o__invalid_parameter_noinfo_noreturn";
-
     public static bool IsHostSystemModule(string module) =>
         ApiRegistry.NormalizeModule(module) is
             "kernel32" or "kernelbase" or "ntdll" or "msvcrt" or "ucrtbase" or
@@ -545,29 +710,6 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         Path.GetFullPath(path).StartsWith(Environment.SystemDirectory + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) &&
         ApiRegistry.NormalizeModule(path) is not ("msvcrt" or "ucrtbase") &&
         FindImportedLibrary(path) is null && !IsDllRedirectPath(path);
-
-    private static bool IsVolumeApi(ApiRegistration? registration) => registration?.Category == ApiCategory.File &&
-        (registration.Name.StartsWith("GetVolume", StringComparison.Ordinal) ||
-         registration.Name.StartsWith("GetDiskFreeSpace", StringComparison.Ordinal) ||
-         registration.Name.StartsWith("GetLogicalDrive", StringComparison.Ordinal) ||
-         registration.Name.StartsWith("GetDriveType", StringComparison.Ordinal) ||
-         registration.Name.StartsWith("QueryDosDevice", StringComparison.Ordinal) ||
-         registration.Name.StartsWith("FindFirstVolume", StringComparison.Ordinal) ||
-         registration.Name.StartsWith("FindNextVolume", StringComparison.Ordinal) ||
-         registration.Name == "FindVolumeClose" ||
-         registration.Name is "NtQueryVolumeInformationFile" or "ZwQueryVolumeInformationFile");
-
-    private static bool IsGuestMemoryApi(ApiRegistration? registration) => registration?.Category == ApiCategory.Memory &&
-        (registration.Name.StartsWith("Virtual", StringComparison.Ordinal) ||
-         registration.Name.EndsWith("VirtualMemory", StringComparison.Ordinal) ||
-         registration.Name.Contains("Heap", StringComparison.Ordinal) ||
-         registration.Name is "GlobalMemoryStatus" or "GlobalMemoryStatusEx" or "GetPhysicallyInstalledSystemMemory" or
-             "GetProcessMemoryInfo" or "K32GetProcessMemoryInfo" or "NtQueryInformationProcess" or "ZwQueryInformationProcess" or
-             "GetPerformanceInfo" or "K32GetPerformanceInfo");
-
-    private static bool IsProcessLocalApi(ApiRegistration? registration) => IsVolumeApi(registration) || IsGuestMemoryApi(registration) ||
-        registration?.Name is "GetFileType" or "CreatePipe" or "PeekNamedPipe" ||
-        registration?.Category is ApiCategory.Library or ApiCategory.Com or ApiCategory.Process or ApiCategory.Thread or ApiCategory.Console;
 
     private ImportResolution? TryResolveImport(PeImport import, ulong? module = null, ImaginedProcess? process = null,
         string? importingPath = null, int depth = 0)
@@ -588,9 +730,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             module = null;
         }
         var policy = Options.ImportPolicy;
-        var managedFound = Apis.TryGet(import.ModuleName, import.DisplayName, out var registration);
-        if (registration is not null &&
-            (IsFailFastApi(registration) || IsProcessLocalApi(registration)))
+        Apis.TryGet(import.ModuleName, import.DisplayName, out var registration);
+        if (registration is { IsPartiallyImagined: false })
             return ManagedImport(registration);
 
         // --host-system-dlls: use the host's fully initialized system DLLs for imports that the
@@ -600,7 +741,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             IsHostSystemModule(import.ModuleName) &&
             ApiRegistry.NormalizeModule(import.ModuleName) is not ("msvcrt" or "ucrtbase"))
         {
-            if (managedFound && registration is not null) return ManagedImport(registration);
+            if (registration is not null) return ManagedImport(registration);
             if (IsNativeForwardingAllowed(import.ModuleName, import.Name, import.Ordinal))
             {
                 var hostAddress = NativeApis.Resolve(import.ModuleName, import.Name, import.Ordinal, out var nativeDetail);
@@ -608,12 +749,10 @@ public sealed unsafe class ImaginedRuntime : IDisposable
                     return ImportResolution.Native(WrapNativeImport(import, hostAddress), nativeDetail);
             }
         }
-        // Package identity belongs to the guest even under native-first import policy.
-        if (registration?.Category == ApiCategory.Package) return ManagedImport(registration);
         var partial = Apis.IsPartiallyImagined(import.ModuleName);
         var mapped = process?.FindModuleByName(import.ModuleName);
         if (mapped is null && process is not null && Options.AllowNativeForwarding && policy != ImportPolicy.ManagedOnly &&
-            (partial || !managedFound || policy == ImportPolicy.NativeFirst))
+            (partial || registration is null))
         {
             var path = process.FindLibraryPath(import.ModuleName, importingPath, partial);
             if (path is not null)
@@ -621,7 +760,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
                 // Windows system DLLs require the host loader's private initialization state.
                 if (ShouldLoadLibraryNatively(path))
                 {
-                    if (managedFound && registration is not null) return ManagedImport(registration);
+                    if (registration is not null) return ManagedImport(registration);
                     if (!IsNativeForwardingAllowed(import.ModuleName, import.Name, import.Ordinal)) return null;
                     var address = NativeApis.Resolve(path, import.Name, import.Ordinal, out var detail);
                     return address == 0 ? null : ImportResolution.Native(WrapNativeImport(import, address), detail);
@@ -630,21 +769,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             }
         }
         if (mapped is not null) return ResolveMappedExport(process!, mapped, import, depth);
-        if (registration is { IsPartiallyImagined: true }) return ManagedImport(registration);
+        if (registration is not null) return ManagedImport(registration);
         if (partial && !NativeDeclarations.IsDeclared(import.ModuleName, import.DisplayName)) return null;
-
-        // Loader and memory operations retain their guest ownership under native-first policy.
-        if (policy == ImportPolicy.NativeFirst && !IsProcessLocalApi(registration))
-        {
-            if (Options.AllowNativeForwarding && IsNativeForwardingAllowed(import.ModuleName, import.Name, import.Ordinal))
-            {
-                var native = ResolveNativeImport(import, module, out var nativeDetail);
-                if (native != 0) return ImportResolution.Native(WrapNativeImport(import, native), nativeDetail);
-            }
-        }
-
-        if (managedFound && registration is not null)
-            return ManagedImport(registration);
 
         if (policy != ImportPolicy.ManagedOnly && Options.AllowNativeForwarding &&
             IsNativeForwardingAllowed(import.ModuleName, import.Name, import.Ordinal))
@@ -657,12 +783,12 @@ public sealed unsafe class ImaginedRuntime : IDisposable
 
     /// <summary>
     /// Whether the configured native forwarding policy permits resolving this export. The default
-    /// policy allows every host export; <see cref="NativeApiPolicy.DeclaredOnly"/> requires an
-    /// assembly-level <see cref="PartiallyImaginedNativeApiAttribute"/> for the same module/name.
+    /// policy allows undeclared exports only when the unimplemented-API fallback is enabled.
+    /// Explicit declarations remain eligible when that fallback is disabled.
     /// </summary>
     public bool IsNativeForwardingAllowed(string moduleName, string? exportName, ushort? ordinal = null)
     {
-        if (Options.NativeApiPolicy == NativeApiPolicy.AllowAll) return true;
+        if (Options.AllowUnimplementedApiForwarding && Options.NativeApiPolicy == NativeApiPolicy.AllowAll) return true;
         if (exportName is not null) return NativeDeclarations.IsDeclared(moduleName, exportName);
         // Ordinal-only imports have no stable name to audit. They are accepted only if a
         // declaration explicitly uses the "#ordinal" spelling.
@@ -759,8 +885,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         var context = new ApiCallContext(process, thread!, module, name, 0, returnAddress, copied, returnAddressSlot);
         try
         {
-            if (registration is null ||
-                (!registration.IsPartiallyImagined && !IsProcessLocalApi(registration) && NativeHandleBridge.NeedsNative(context)))
+            if (registration is null)
             {
                 if (!Options.AllowNativeForwarding || Options.ImportPolicy == ImportPolicy.ManagedOnly ||
                     !IsNativeForwardingAllowed(module, name) ||
@@ -775,7 +900,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             if (context.PendingThreadExitCode is int exitCode)
             {
                 if (context.TryRedirectThreadExit()) result = unchecked((uint)exitCode);
-                else ImaginedNT.Core.Native.NativeMethods.ExitThread(unchecked((uint)exitCode));
+                else if (!thread!.IsImaginedEntry) ImaginedNT.Core.Native.NativeMethods.ExitThread(unchecked((uint)exitCode));
             }
             // Nt* syscall handlers return an NTSTATUS in rax; that value is the syscall result.
             return (uint)result;
@@ -835,7 +960,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             frame->ReturnAddress, args, returnAddressSlot);
         try
         {
-            if (thread.TerminationRequested)
+            if (thread.TerminationRequested && !thread.IsImaginedEntry)
             {
                 // TerminateThread is not a supported way to stop a CLR thread.  Unwind the guest
                 // through its own stub instead: the next managed call after Terminate returns to
@@ -855,7 +980,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
                 return unchecked((uint)requestedExit);
             }
 
-            var result = InvokeManagedHandler(registration, context);
+            var result = registration.Handler(context);
             // Tracing writes files/console and would otherwise clobber the host thread's
             // last-error slot between the handler and the guest's next GetLastError.
             var lastError = ImaginedNT.Core.Native.NativeMethods.GetLastError();
@@ -868,7 +993,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
                     // The stub will ret into the unmanaged exit trampoline, which uses EAX.
                     return unchecked((uint)exitCode);
                 }
-                ImaginedNT.Core.Native.NativeMethods.ExitThread(unchecked((uint)exitCode));
+                if (!thread.IsImaginedEntry) ImaginedNT.Core.Native.NativeMethods.ExitThread(unchecked((uint)exitCode));
             }
             return completed;
         }
@@ -899,21 +1024,6 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         }
     }
 
-    private ulong InvokeManagedHandler(ApiRegistration registration, ApiCallContext context)
-    {
-        if (registration.IsPartiallyImagined || IsProcessLocalApi(registration) || !NativeHandleBridge.NeedsNative(context))
-            return registration.Handler(context);
-        var allowed = Options.AllowNativeForwarding && Options.ImportPolicy != ImportPolicy.ManagedOnly &&
-                      IsNativeForwardingAllowed(context.Module, context.Name);
-        var target = allowed ? NativeApis.Resolve(context.Module, context.Name, null, out _) : 0;
-        if (target != 0) return NativeHandleBridge.Invoke(context, target);
-        if (NativeHandleBridge.IsNtApi(context.Module, context.Name))
-            return allowed ? Nt.NtStatus.EntrypointNotFound : Nt.NtStatus.NotSupported;
-        context.SetLastError(allowed ? 127 : 50);
-        return context.Name.StartsWith("WaitFor", StringComparison.Ordinal) || context.Name == "SetFilePointer"
-            ? uint.MaxValue : 0;
-    }
-
     /// <summary>Patch direct syscalls in a newly loaded image; the process owns the interceptor.</summary>
     internal SyscallInterceptor? InstallSyscallInterceptor(ImaginedProcess process, PeMappedImage image)
     {
@@ -936,9 +1046,11 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         }
     }
 
-    /// <summary>Load and run one image in a new imagined process.  Returns the guest exit code.</summary>
+    /// <summary>ExecuteImage 启用时创建并运行映像，返回退出码；关闭时不创建进程并返回 0。</summary>
     public int Run(string imagePath, TimeSpan? timeout = null, string? commandLine = null, ulong forcedBase = 0)
     {
+        ObjectDisposedException.ThrowIf(_disposed || IsBugChecked, this);
+        if (!Options.ExecuteImage) return 0;
         var process = CreateProcess(new ProcessCreateOptions
         {
             ImagePath = imagePath,
@@ -979,6 +1091,43 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         return 0; // EXCEPTION_CONTINUE_SEARCH
     }
 
+    public void StopWithBugCheck(string? message = null)
+    {
+        ImaginedProcess[] processes;
+        lock (_gate)
+        {
+            if (_disposed || Interlocked.Exchange(ref _bugChecked, 1) != 0) return;
+            processes = _processes.ToArray();
+        }
+        var stack = new System.Diagnostics.StackTrace(1, true).ToString();
+        const int exitCode = unchecked((int)0xDEAD0001);
+        try
+        {
+            Trace.Error($"BUGCHECK: {message ?? "Fatal error occurs"}\nCaller stack:\n{stack}");
+            var memory = Memory.GetSnapshot();
+            Trace.Error($"Kernel: started={_startTime:O}, processes={processes.Length}, APIs={Apis.Count}, " +
+                $"virtualBytes={memory.VirtualBytes}, committed={memory.Process.PrivateUsage}");
+            foreach (var p in processes)
+            {
+                Trace.Error($"Process: id={p.Id}, parent={p.ParentId}, image={p.ImagePath}, exit={p.ExitCode}, terminating={p.IsTerminating}");
+                foreach (var t in p.Threads)
+                    Trace.Error($"Thread: pid={p.Id}, tid={t.Id}, native={t.NativeId}, state={t.State}, start=0x{t.StartAddress:X}, exit={t.ExitCode}");
+                foreach (var m in p.LoadedModules) Trace.Error($"Module: pid={p.Id}, {m}");
+                foreach (var h in p.Handles.Snapshot()) Trace.Error($"Handle: pid={p.Id}, {h}");
+            }
+            Trace.Flush();
+        }
+        finally
+        {
+            foreach (var p in processes.Reverse())
+                try { p.Terminate(exitCode); }
+                catch (Exception ex) { Trace.Error($"bugcheck termination failed: pid={p.Id}: {ex}"); }
+            try { BugChecked?.Invoke(message ?? "Fatal error occurs"); }
+            catch (Exception ex) { Trace.Error($"bugcheck notification failed: {ex}"); }
+            Dispose();
+        }
+    }
+
     public void Dispose()
     {
         ImaginedProcess[] processes;
@@ -987,7 +1136,6 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             if (_disposed) return;
             _disposed = true;
             processes = _processes.ToArray();
-            _processes.Clear();
         }
 
         // Children are disposed first: their memory and threads go away before the root's, and
@@ -1000,8 +1148,28 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         if (processes.Any(p => p.HasRunningThreads))
         {
             Trace.Warn("runtime still has running guest threads; retaining shared resources");
+            // A new runtime may reuse this path before the remaining guest threads exit.
+            Trace.CloseFile();
+            ThreadPool.QueueUserWorkItem(state =>
+            {
+                try
+                {
+                    foreach (var thread in processes.SelectMany(p => p.Threads).Where(t => t.IsExecutionActive))
+                        thread.Wait(Timeout.InfiniteTimeSpan, out _);
+                    if (!processes.Any(p => p.HasRunningThreads)) DisposeResources(processes);
+                }
+                catch (Exception ex) { Trace.Error($"deferred runtime cleanup failed: {ex}"); }
+            });
             return;
         }
+        DisposeResources(processes);
+    }
+
+    private void DisposeResources(ImaginedProcess[] processes)
+    {
+        foreach (var process in processes)
+            try { process.Dispose(); }
+            catch (Exception ex) { Trace.Warn($"process {process.Id} cleanup failed: {ex}", process.Id); }
         _threadsByNativeId.Clear();
         if (_diagnosticHandler != IntPtr.Zero)
         {

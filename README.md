@@ -19,6 +19,12 @@ There is also GUI Support for `CreateWindowEx`, `ShowWindow`, `SetPixel`, `GetPi
 
 ## Quick start
 
+The runtime supports multiple virtual NT sessions; see [NT sessions](docs/SESSIONS.md)
+for session management, process assignment and named-object namespaces.
+
+Managed methods can also run as virtual processes without a PE file; see
+[Imagined Process](docs/IMAGINED-PROCESSES.md) for context, cancellation and exit-code APIs.
+
 ```powershell
 # Build the managed layer and runner (requires .NET 10 SDK)
 dotnet build ImaginedNT.slnx
@@ -88,7 +94,7 @@ ImaginedNT.Host run app.exe --sandbox sandbox\system --drive D=D:\GuestData --dr
 ```
 
 Volume information, disk space, drive enumeration, DOS device queries and volume GUID queries
-use simulated metadata, including under `--native-first`. Each drive has a stable synthetic
+use simulated metadata. Each drive has a stable synthetic
 serial number and volume GUID; defaults report 128 GiB total and 64 GiB free. These are fixed
 reported values, not storage quotas, and do not track host free space or guest writes.
 `NtQueryVolumeInformationFile` supports volume, size, device, attributes, full size and sector
@@ -162,7 +168,7 @@ attribute accepts a `ushort` ordinal instead of a name, and supports `module!nam
 Delay imports bind on their first call, then cache the resolved thunk without modifying the
 protected IAT. Unused delay dependencies are not loaded or initialized.
 
-These replacements take priority even under `native-first`. Static/delay imports,
+Registered runtime implementations always take priority. Static/delay imports,
 `GetProcAddress`/`LdrGetProcedureAddress`, export forwarders, and calls to a replaced export from
 inside a guest-mapped DLL all use the same implementation. The original function body is never
 called for a replaced export. Other exports use the native code in that process's mapped DLL,
@@ -358,7 +364,7 @@ Package queries expose only the configured package (one application, no dependen
 Name/ID conversions and validation reuse Windows functions that operate on caller data;
 `PackageIdFromFullName` with `PACKAGE_INFORMATION_FULL` reads the simulated package.
 The API-set aliases, including `ext-ms-win-kernel32-package-l1-1-0.dll`, resolve through
-the existing registry. These APIs stay virtual under `native-first`, including dynamic lookup.
+the existing registry. These APIs stay virtual, including dynamic lookup.
 Calls internal to Windows-loaded host DLLs and WinRT package objects remain outside this surface.
 
 ## Simulated Windows version and branding
@@ -394,7 +400,7 @@ left to the host's `winbrand.dll`.
 | Map image, copy sections, apply `DIR64`/`HIGHLOW`/`HIGH`/`LOW` relocations | ✅ |
 | IAT patching to managed thunks or native exports | ✅ |
 | Guest DLL loading: map, relocate, patch imports, call `DllMain`, resolve exports | ✅ |
-| Managed↔native import policy (`managed-first`, `managed-only`, `native-first`) | ✅ |
+| Runtime-first import policy (`managed-first`, `managed-only`) and optional native fallback | ✅ |
 | Direct `syscall` trap via VEH + real ntdll syscall-number discovery | ✅ |
 | Real `NtClose` syscall number read from ntdll and emulated by managed `NtClose` | ✅ |
 | Real MSVC CRT-free PE execution on a real host thread | ✅ |
@@ -438,6 +444,11 @@ The 346 safe-native exports are declared in
 enforced with `--native-declared-only` (or `--native-policy declared-only`). The default
 `--native-policy allow-all` keeps the existing behavior; `--strict` still disables native
 forwarding entirely.
+
+`RuntimeOptions.AllowUnimplementedApiForwarding` defaults to `true`, allowing native fallback
+for APIs without a runtime implementation. Set it to `false` (CLI: `--no-native-fallback`)
+to retain only native forwards declared with `[PartiallyImaginedNativeApi]`.
+Registered runtime implementations always take priority over native exports.
 
 ## How it works
 
@@ -528,8 +539,8 @@ scripts/                    Build/test/sample helpers
   guest process emits `Warning: API not redirected` with its DLL, export and native address.
   Use `--verbose` to see these warnings on stderr or `--trace <file>` to save them as JSONL.
   Ordinary imports, eagerly resolved delay imports, `GetProcAddress` and
-  `LdrGetProcedureAddress` use the same resolution policy. Symbol lookup stays managed even
-  under `native-first`. Data exports retain their original addresses; calls made internally
+  `LdrGetProcedureAddress` use the same resolution policy. Symbol lookup stays managed.
+  Data exports retain their original addresses; calls made internally
   by Windows-loaded native DLLs are outside this interception boundary.
 - `--wrap-native-handles` (`RuntimeOptions.WrapNativeHandles`, default `false`) wraps handles
   returned by intercepted native NT calls in per-process `ImaginedHandle` entries. Closing,

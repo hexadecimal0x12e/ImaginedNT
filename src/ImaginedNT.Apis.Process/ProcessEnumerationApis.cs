@@ -82,8 +82,7 @@ public static unsafe class ProcessEnumerationApis
             // 未模拟的进程/句柄列表不能转发为宿主列表。
             if (infoClass is 16 or 53 or 64 or 88 or 148 || !ctx.Runtime.Options.AllowNativeForwarding ||
                 ctx.Runtime.Options.ImportPolicy == ImportPolicy.ManagedOnly ||
-                ctx.Runtime.Options.NativeApiPolicy == NativeApiPolicy.DeclaredOnly &&
-                !ctx.Runtime.NativeDeclarations.IsDeclared("ntdll", "NtQuerySystemInformation"))
+                !ctx.Runtime.IsNativeForwardingAllowed("ntdll", "NtQuerySystemInformation"))
                 return NtStatus.InvalidInfoClass;
             var address = ctx.Runtime.NativeApis.Resolve("ntdll.dll", "NtQuerySystemInformation", null, out _);
             return address == 0 ? NtStatus.InvalidInfoClass :
@@ -127,7 +126,8 @@ public static unsafe class ProcessEnumerationApis
                     NumberOfThreadsHighWatermark = (uint)p.Threads.Count,
                     CreateTime = p.StartTime.UtcDateTime.ToFileTimeUtc(), ImageName = name,
                     BasePriority = p.Priority, ProcessId = (ulong)p.Id, ParentProcessId = (ulong)p.ParentId,
-                    HandleCount = (uint)p.HandleCount, PeakVirtualSize = m.PeakVirtualBytes, VirtualSize = m.VirtualBytes,
+                    HandleCount = (uint)p.HandleCount, SessionId = p.SessionId,
+                    PeakVirtualSize = m.PeakVirtualBytes, VirtualSize = m.VirtualBytes,
                     PageFaultCount = m.Process.PageFaultCount,
                     PeakWorkingSetSize = m.Process.PeakWorkingSetSize, WorkingSetSize = m.Process.WorkingSetSize,
                     PagefileUsage = m.Process.PagefileUsage, PeakPagefileUsage = m.Process.PeakPagefileUsage,

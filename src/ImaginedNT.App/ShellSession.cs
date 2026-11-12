@@ -12,6 +12,7 @@ internal sealed class ShellSession(RuntimeOptions options, TraceLog log) : IAsyn
     private readonly TerminalOutput _output = new();
     private ImaginedRuntime? _runtime;
     private Task<ProcessExitInfo>? _run;
+    private readonly TaskCompletionSource<ProcessExitInfo> _idle = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public ImaginedRuntime? Runtime => Volatile.Read(ref _runtime);
     public bool IsRunning => _run is { IsCompleted: false };
@@ -20,7 +21,7 @@ internal sealed class ShellSession(RuntimeOptions options, TraceLog log) : IAsyn
 
     public Task<ProcessExitInfo> RunAsync()
     {
-        _run = Task.Run(() =>
+        _run = Task.Run(async () =>
         {
             if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
                 throw new PlatformNotSupportedException("ImaginedNT 运行时需要 x64，请使用 x64 配置启动。");
@@ -36,6 +37,7 @@ internal sealed class ShellSession(RuntimeOptions options, TraceLog log) : IAsyn
             options.StandardError = _output;
             var runtime = BuiltinApis.CreateRuntime(options);
             Volatile.Write(ref _runtime, runtime);
+            if (!options.ExecuteImage) return await _idle.Task.ConfigureAwait(false);
             var process = runtime.CreateProcess(shell, "\"C:\\shell.exe\"", "C:\\");
             try
             {
@@ -55,6 +57,7 @@ internal sealed class ShellSession(RuntimeOptions options, TraceLog log) : IAsyn
     public async Task StopAsync()
     {
         _input.Complete();
+        _idle.TrySetResult(new ProcessExitInfo(0, false, TimeSpan.Zero));
         if (_run is null) return;
         await Task.WhenAny(_run, Task.Delay(300));
         await Task.Run(() =>

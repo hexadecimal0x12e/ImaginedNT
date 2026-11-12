@@ -65,6 +65,14 @@ public static class MemoryInformationApis
         var process = GetProcessInformation(ctx, ctx.Arg(0));
         if (process is null) return NtStatus.InvalidHandle;
         var length = ctx.Arg32(3);
+        if (ctx.Arg32(1) == 24) // ProcessSessionInformation
+        {
+            if (ctx.Arg(4) != 0) ctx.Write(ctx.Arg(4), 4u);
+            if (length != 4) return NtStatus.InfoLengthMismatch;
+            if (ctx.Arg(2) == 0) return NtStatus.AccessViolation;
+            ctx.Write(ctx.Arg(2), process.SessionId);
+            return NtStatus.Success;
+        }
         if (ctx.Arg32(1) == 0) // ProcessBasicInformation, AMD64
         {
             if (ctx.Arg(4) != 0) ctx.Write(ctx.Arg(4), 48u);

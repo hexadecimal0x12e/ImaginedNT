@@ -142,6 +142,7 @@ public static class ProcessApis
                 SandboxRoot = ctx.Process.FileSystem.Root,
                 ParentId = ctx.Process.Id,
                 IsRoot = false,
+                Desktop = ReadStartupDesktop(ctx, ctx.Arg(8), unicode),
                 Environment = environment
             });
 
@@ -248,6 +249,13 @@ public static class ProcessApis
             ctx.Memory.Read<ulong>(pointer + 80),
             ctx.Memory.Read<ulong>(pointer + 88),
             ctx.Memory.Read<ulong>(pointer + 96));
+    }
+
+    private static string? ReadStartupDesktop(ApiCallContext ctx, ulong pointer, bool unicode)
+    {
+        if (pointer == 0 || ctx.Read<uint>(pointer) < 24) return null;
+        var desktop = ctx.Read<ulong>(pointer + 16);
+        return desktop == 0 ? null : unicode ? ctx.ReadUnicodeString(desktop) : ctx.ReadAnsiString(desktop);
     }
 
     private static IReadOnlyDictionary<string, string>? ReadEnvironmentBlock(ApiCallContext ctx, ulong pointer, bool unicode)

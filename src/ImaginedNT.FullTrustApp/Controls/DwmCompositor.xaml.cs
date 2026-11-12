@@ -9,7 +9,7 @@ using System.Runtime.InteropServices.WindowsRuntime;
 using Windows.Foundation;
 using Windows.System;
 using Windows.UI;
-using Windows.UI.Text;
+using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Input;
@@ -28,7 +28,10 @@ public sealed partial class DwmCompositor : UserControl
         public Grid Layout = null!;
         public Grid? TitleBar;
         public TextBlock? TitleText;
+        public Button? MinimizeButton;
+        public Button? MaximizeButton;
         public Button? CloseButton;
+        public WindowSnapshot Snapshot = null!;
         public Border? ContentSurface;
         public Canvas? ChildCanvas;
         public TextBlock? ChildText;
@@ -38,12 +41,19 @@ public sealed partial class DwmCompositor : UserControl
         public long FrameVersion;
     }
 
-    private static readonly Color AccentColor = Color.FromArgb(0xFF, 0x38, 0x8B, 0xFD);
-    private static readonly Color InactiveBorderColor = Color.FromArgb(0xFF, 0x30, 0x36, 0x3D);
-    private static readonly Color ChromeColor = Color.FromArgb(0xFF, 0x22, 0x27, 0x2E);
-    private static readonly Color FrameColor = Color.FromArgb(0xFF, 0x16, 0x1B, 0x22);
-    private static readonly Color TitleTextColor = Color.FromArgb(0xFF, 0xD8, 0xDF, 0xE8);
-    private static readonly Color MutedTextColor = Color.FromArgb(0xFF, 0x9A, 0xA4, 0xB2);
+    private static readonly Color AccentColor = Color.FromArgb(0xFF, 0x80, 0x80, 0x80);
+    private static readonly Color InactiveBorderColor = Color.FromArgb(0xFF, 0xB8, 0xB8, 0xB8);
+    private static readonly Color ChromeColor = Color.FromArgb(0xFF, 0xF3, 0xF3, 0xF3);
+    private static readonly Color FrameColor = Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF);
+    private static readonly Color TitleTextColor = Color.FromArgb(0xFF, 0x00, 0x00, 0x00);
+    private static readonly Color MutedTextColor = Color.FromArgb(0xFF, 0x77, 0x77, 0x77);
+
+    [Flags]
+    private enum ResizeEdge
+    {
+        None = 0, Left = 1, Top = 2, Right = 4, Bottom = 8,
+        TopLeft = Top | Left, TopRight = Top | Right, BottomLeft = Bottom | Left, BottomRight = Bottom | Right
+    }
 
     private readonly Dictionary<ulong, WindowVisual> _visuals = new();
     private WindowManager? _manager;
@@ -51,9 +61,14 @@ public sealed partial class DwmCompositor : UserControl
     private ulong _dragHandle;
     private int _dragOffsetX;
     private int _dragOffsetY;
+    private ResizeEdge _resizeEdge;
+    private GuiRect _dragRect;
+    private InputSystemCursorShape _cursorShape;
+    private readonly Dictionary<InputSystemCursorShape, InputSystemCursor> _cursors = new();
     private int _pressedButton = -1;
     private Window? _hostWindow;
     private bool _restoreKeyboardFocus;
+    private ImaginedNT.Core.Runtime.DesktopObject? _desktop;
 
     public DwmCompositor()
     {
@@ -79,7 +94,13 @@ public sealed partial class DwmCompositor : UserControl
 
     public void Attach(WindowManager? manager)
     {
-        if (!ReferenceEquals(_manager, manager)) _manager?.ReleaseKeyboard();
+        if (!ReferenceEquals(_manager, manager))
+        {
+            ResetPointerState();
+            ReleasePointerCaptures();
+            _manager?.ReleaseKeyboard();
+            ClearVisuals();
+        }
         _manager = manager;
         _lastVersion = -1;
         if (manager is null)
@@ -103,11 +124,18 @@ public sealed partial class DwmCompositor : UserControl
             return;
         }
         var version = manager.Version;
+        if (_desktop != manager.DisplayDesktop || IsEnabled != manager.IsInputDesktop)
+        {
+            _desktop = manager.DisplayDesktop;
+            ResetPointerState();
+            ReleasePointerCaptures();
+        }
+        IsEnabled = manager.IsInputDesktop;
         if (version != _lastVersion)
         {
             _lastVersion = version;
             var snapshots = manager.Snapshot();
-            UpdateVisuals(snapshots);
+            UpdateVisuals(snapshots.Where(s => s.Desktop == manager.DisplayDesktop).ToArray());
             (manager.Drawing as GdiDrawing)?.Prune(snapshots);
         }
         if (manager.Drawing is GdiDrawing drawing)
@@ -207,6 +235,7 @@ public sealed partial class DwmCompositor : UserControl
 
     private void OnSizeChanged(object sender, SizeChangedEventArgs args)
     {
+        Surface.Clip = new RectangleGeometry { Rect = new Rect(0, 0, args.NewSize.Width, args.NewSize.Height) };
         _manager?.SetScreenSize(Math.Max(1, (int)args.NewSize.Width), Math.Max(1, (int)args.NewSize.Height));
         Sync();
     }
@@ -214,6 +243,7 @@ public sealed partial class DwmCompositor : UserControl
     private void ClearVisuals()
     {
         Surface.Children.Clear();
+        MinimizedWindows.Children.Clear();
         _visuals.Clear();
         _lastVersion = -1;
     }
@@ -239,7 +269,18 @@ public sealed partial class DwmCompositor : UserControl
             _visuals.Remove(handle);
         }
 
-        EmptyHint.Visibility = _visuals.Values.Any(v => !v.IsChild) ? Visibility.Collapsed : Visibility.Visible;
+        MinimizedWindows.Children.Clear();
+        foreach (var snapshot in snapshots.Where(s => !s.IsChild && s.Minimized && (s.Style & Win32.WS_VISIBLE) != 0))
+        {
+            var restore = new Button
+            {
+                Content = snapshot.Title, MaxWidth = 220, IsTabStop = false, IsEnabled = snapshot.Enabled
+            };
+            ToolTipService.SetToolTip(restore, "还原窗口");
+            restore.Click += (_, _) => SendCaptionCommand(snapshot.Handle, Win32.SC_RESTORE);
+            MinimizedWindows.Children.Add(restore);
+        }
+        EmptyHint.Visibility = snapshots.Any(s => !s.IsChild && (s.Visible || s.Minimized)) ? Visibility.Collapsed : Visibility.Visible;
     }
 
     private WindowVisual CreateVisual(WindowSnapshot snapshot)
@@ -250,7 +291,8 @@ public sealed partial class DwmCompositor : UserControl
             Background = new SolidColorBrush(FrameColor),
             BorderBrush = new SolidColorBrush(InactiveBorderColor),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(snapshot.IsChild ? 3 : 7),
+            CornerRadius = new CornerRadius(snapshot.IsChild ? 0 : 7),
+            RequestedTheme = ElementTheme.Light,
             Tag = visual
         };
         visual.Frame = frame;
@@ -272,7 +314,7 @@ public sealed partial class DwmCompositor : UserControl
                     Background = new SolidColorBrush(ColorFromArgb(snapshot.BackgroundArgb)),
                     Foreground = new SolidColorBrush(ColorFromArgb(snapshot.ForegroundArgb)),
                     BorderThickness = new Thickness(1),
-                    BorderBrush = new SolidColorBrush(Color.FromArgb(0xFF, 0x44, 0x4C, 0x56))
+                    BorderBrush = new SolidColorBrush(InactiveBorderColor)
                 };
                 button.Click += (_, _) =>
                 {
@@ -301,60 +343,36 @@ public sealed partial class DwmCompositor : UserControl
 
         var layout = new Grid();
         visual.Layout = layout;
-        var hasCaption = snapshot.HasCaption;
-        if (hasCaption)
+        layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(WindowGeometry.CaptionHeight) });
+        layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        var titleBar = new Grid { Background = new SolidColorBrush(ChromeColor) };
+        titleBar.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        titleBar.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var title = new TextBlock
         {
-            layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(30) });
-            layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-
-            var titleBar = new Grid
-            {
-                Background = new SolidColorBrush(ChromeColor),
-                Height = 30
-            };
-            Grid.SetRow(titleBar, 0);
-            var title = new TextBlock
-            {
-                Text = string.IsNullOrEmpty(snapshot.Title) ? snapshot.ClassName : snapshot.Title,
-                Margin = new Thickness(10, 0, 42, 0),
-                VerticalAlignment = VerticalAlignment.Center,
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                FontSize = 13,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush(TitleTextColor)
-            };
-            var close = new Button
-            {
-                Content = "\u2715",
-                Width = 36,
-                Height = 24,
-                MinWidth = 0,
-                MinHeight = 0,
-                Padding = new Thickness(0),
-                Margin = new Thickness(0, 0, 6, 0),
-                HorizontalAlignment = HorizontalAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Center,
-                FontSize = 11,
-                Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
-                BorderThickness = new Thickness(0),
-                Foreground = new SolidColorBrush(MutedTextColor)
-            };
-            close.Click += (_, _) =>
-            {
-                _manager?.Activate(snapshot.Handle);
-                _manager?.RequestClose(snapshot.Handle);
-            };
-            titleBar.Children.Add(title);
-            titleBar.Children.Add(close);
-            layout.Children.Add(titleBar);
-            visual.TitleBar = titleBar;
-            visual.TitleText = title;
-            visual.CloseButton = close;
-        }
-        else
-        {
-            layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        }
+            Margin = new Thickness(10, 0, 8, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            FontSize = 12,
+            Foreground = new SolidColorBrush(TitleTextColor)
+        };
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal };
+        Grid.SetColumn(buttons, 1);
+        visual.MinimizeButton = CreateCaptionButton(visual, "\uE921", "最小化", Win32.SC_MINIMIZE);
+        visual.MaximizeButton = CreateCaptionButton(visual, "\uE922", "最大化", Win32.SC_MAXIMIZE);
+        visual.CloseButton = CreateCaptionButton(visual, "\uE8BB", "关闭", Win32.SC_CLOSE);
+        visual.CloseButton.Resources["ButtonBackgroundPointerOver"] = new SolidColorBrush(Color.FromArgb(0xFF, 0xC4, 0x2B, 0x1C));
+        visual.CloseButton.Resources["ButtonForegroundPointerOver"] = new SolidColorBrush(Microsoft.UI.Colors.White);
+        visual.CloseButton.Resources["ButtonBackgroundPressed"] = new SolidColorBrush(Color.FromArgb(0xFF, 0xA0, 0x20, 0x15));
+        visual.CloseButton.Resources["ButtonForegroundPressed"] = new SolidColorBrush(Microsoft.UI.Colors.White);
+        buttons.Children.Add(visual.MinimizeButton);
+        buttons.Children.Add(visual.MaximizeButton);
+        buttons.Children.Add(visual.CloseButton);
+        titleBar.Children.Add(title);
+        titleBar.Children.Add(buttons);
+        layout.Children.Add(titleBar);
+        visual.TitleBar = titleBar;
+        visual.TitleText = title;
 
         var contentSurface = new Border
         {
@@ -368,7 +386,7 @@ public sealed partial class DwmCompositor : UserControl
             VerticalAlignment = VerticalAlignment.Stretch
         };
         contentSurface.Child = childCanvas;
-        Grid.SetRow(contentSurface, hasCaption ? 1 : 0);
+        Grid.SetRow(contentSurface, 1);
         layout.Children.Add(contentSurface);
         visual.ContentSurface = contentSurface;
         visual.ChildCanvas = childCanvas;
@@ -376,10 +394,33 @@ public sealed partial class DwmCompositor : UserControl
         return visual;
     }
 
+    private Button CreateCaptionButton(WindowVisual visual, string glyph, string tooltip, uint command)
+    {
+        var button = new Button
+        {
+            Style = (Style)Resources["CaptionButtonStyle"],
+            Content = new FontIcon { FontFamily = new FontFamily("Segoe MDL2 Assets"), Glyph = glyph, FontSize = 10 }
+        };
+        ToolTipService.SetToolTip(button, tooltip);
+        button.Click += (_, _) => SendCaptionCommand(visual.Handle,
+            command == Win32.SC_MAXIMIZE && visual.Snapshot.Maximized ? Win32.SC_RESTORE : command);
+        return button;
+    }
+
+    private void SendCaptionCommand(ulong handle, uint command)
+    {
+        Focus(FocusState.Programmatic);
+        _manager?.Activate(handle);
+        if (_manager?.PostMessage(handle, Win32.WM_SYSCOMMAND, command, 0) == false)
+            AppRuntime.Log.Warn($"desktop window command failed: hwnd=0x{handle:X}, command=0x{command:X}");
+    }
+
     private void UpdateVisual(WindowVisual visual, WindowSnapshot snapshot, IReadOnlyDictionary<ulong, WindowSnapshot> byHandle)
     {
+        visual.Snapshot = snapshot;
         var frame = visual.Frame;
         frame.Visibility = snapshot.Visible ? Visibility.Visible : Visibility.Collapsed;
+        frame.IsHitTestVisible = snapshot.Enabled;
         frame.Width = Math.Max(1, snapshot.Outer.Width);
         frame.Height = Math.Max(1, snapshot.Outer.Height);
         Canvas.SetZIndex(frame, snapshot.ZOrder);
@@ -429,14 +470,46 @@ public sealed partial class DwmCompositor : UserControl
         }
         Canvas.SetLeft(frame, snapshot.Outer.X);
         Canvas.SetTop(frame, snapshot.Outer.Y);
+        frame.BorderThickness = new Thickness(snapshot.Client.X - snapshot.Outer.X);
         if (visual.TitleText is not null)
         {
-            visual.TitleText.Text = string.IsNullOrEmpty(snapshot.Title) ? snapshot.ClassName : snapshot.Title;
+            visual.TitleText.Text = snapshot.Title;
+            visual.TitleText.Foreground = new SolidColorBrush(snapshot.Active ? TitleTextColor : MutedTextColor);
         }
         if (visual.ContentSurface is not null)
+        {
             visual.ContentSurface.Background = new SolidColorBrush(ColorFromArgb(snapshot.BackgroundArgb));
+            visual.ContentSurface.Clip = new RectangleGeometry { Rect = new Rect(0, 0, snapshot.Client.Width, snapshot.Client.Height) };
+            visual.ContentSurface.CornerRadius = snapshot.Maximized || frame.BorderThickness.Left == 0
+                ? new CornerRadius(0) : new CornerRadius(0, 0, 6, 6);
+        }
         if (visual.TitleBar is not null)
+        {
             visual.TitleBar.Visibility = snapshot.HasCaption ? Visibility.Visible : Visibility.Collapsed;
+            visual.Layout.RowDefinitions[0].Height = new GridLength(snapshot.HasCaption ? WindowGeometry.CaptionHeight : 0);
+        }
+        frame.CornerRadius = new CornerRadius(snapshot.Maximized || frame.BorderThickness.Left == 0 ? 0 : 7);
+        var hasSystemMenu = (snapshot.Style & Win32.WS_SYSMENU) != 0;
+        var isToolWindow = (snapshot.ExStyle & Win32.WS_EX_TOOLWINDOW) != 0;
+        if (visual.CloseButton is not null)
+        {
+            visual.CloseButton.Visibility = hasSystemMenu ? Visibility.Visible : Visibility.Collapsed;
+            visual.CloseButton.IsEnabled = snapshot.Enabled;
+        }
+        if (visual.MinimizeButton is not null)
+        {
+            visual.MinimizeButton.Visibility = hasSystemMenu && !isToolWindow && (snapshot.Style & Win32.WS_MINIMIZEBOX) != 0
+                ? Visibility.Visible : Visibility.Collapsed;
+            visual.MinimizeButton.IsEnabled = snapshot.Enabled;
+        }
+        if (visual.MaximizeButton is not null)
+        {
+            visual.MaximizeButton.Visibility = hasSystemMenu && !isToolWindow && (snapshot.Style & Win32.WS_MAXIMIZEBOX) != 0
+                ? Visibility.Visible : Visibility.Collapsed;
+            visual.MaximizeButton.IsEnabled = snapshot.Enabled;
+            ((FontIcon)visual.MaximizeButton.Content).Glyph = snapshot.Maximized ? "\uE923" : "\uE922";
+            ToolTipService.SetToolTip(visual.MaximizeButton, snapshot.Maximized ? "还原" : "最大化");
+        }
     }
 
     private void RemoveVisual(WindowVisual visual)
@@ -468,18 +541,26 @@ public sealed partial class DwmCompositor : UserControl
         Focus(FocusState.Programmatic);
         var hit = manager.HitTest(x, y);
         if (!hit.IsValid) return;
+        if (!_visuals.TryGetValue(hit.TopLevelHandle, out var visual) || !visual.Snapshot.Enabled) return;
         manager.SetPointerPosition(x, y);
-        manager.Activate(hit.Handle);
 
         _pressedButton = button;
+        _resizeEdge = button == 0 ? GetResizeEdge(hit, x, y) : ResizeEdge.None;
+        if (_resizeEdge != ResizeEdge.None)
+            hit = new WindowHit(hit.TopLevelHandle, hit.TopLevelHandle, WindowHitRegion.Border,
+                x, y, visual.Snapshot.Outer, visual.Snapshot.Client, false);
+        manager.Activate(hit.Handle);
         manager.MouseDown(hit, button);
-        if (button == 0 && hit.Region == WindowHitRegion.Caption)
+        if (button == 0 && !visual.Snapshot.Maximized && (_resizeEdge != ResizeEdge.None || hit.Region == WindowHitRegion.Caption))
         {
             _dragHandle = hit.TopLevelHandle;
-            _dragOffsetX = x - hit.WindowRect.X;
-            _dragOffsetY = y - hit.WindowRect.Y;
+            _dragRect = visual.Snapshot.Outer;
+            _dragOffsetX = x;
+            _dragOffsetY = y;
+            manager.PostMessage(_dragHandle, Win32.WM_ENTERSIZEMOVE, 0, 0);
         }
         CapturePointer(args.Pointer);
+        SetResizeCursor(_resizeEdge);
         args.Handled = true;
     }
 
@@ -493,18 +574,74 @@ public sealed partial class DwmCompositor : UserControl
         manager.SetPointerPosition(x, y);
         if (_dragHandle != 0)
         {
-            if (manager.GetWindowRect(_dragHandle, out var rect, out _))
+            if (!_visuals.TryGetValue(_dragHandle, out var visual) || !visual.Snapshot.Visible ||
+                !visual.Snapshot.Enabled || visual.Snapshot.Maximized ||
+                (_resizeEdge != ResizeEdge.None && (visual.Snapshot.Style & Win32.WS_THICKFRAME) == 0))
             {
-                var newX = x - _dragOffsetX;
-                var newY = y - _dragOffsetY;
-                manager.MoveWindow(_dragHandle, newX, newY, rect.Width, rect.Height);
-                manager.NotifyWindowMoved(_dragHandle, newX, newY);
-                Sync();
+                ResetPointerState();
+                ReleasePointerCaptures();
+                return;
             }
+            var dx = x - _dragOffsetX;
+            var dy = y - _dragOffsetY;
+            if (_resizeEdge == ResizeEdge.None)
+            {
+                if (manager.GetWindowRect(_dragHandle, out var rect, out _) &&
+                    (rect.X != _dragRect.X + dx || rect.Y != _dragRect.Y + dy))
+                {
+                    manager.MoveWindow(_dragHandle, _dragRect.X + dx, _dragRect.Y + dy, rect.Width, rect.Height);
+                    manager.NotifyWindowMoved(_dragHandle, _dragRect.X + dx, _dragRect.Y + dy);
+                }
+            }
+            else
+            {
+                var left = _dragRect.X;
+                var top = _dragRect.Y;
+                var right = _dragRect.Right;
+                var bottom = _dragRect.Bottom;
+                if ((_resizeEdge & ResizeEdge.Left) != 0) left = Math.Min(right - 160, left + dx);
+                if ((_resizeEdge & ResizeEdge.Right) != 0) right = Math.Max(left + 160, right + dx);
+                if ((_resizeEdge & ResizeEdge.Top) != 0) top = Math.Min(bottom - 60, top + dy);
+                if ((_resizeEdge & ResizeEdge.Bottom) != 0) bottom = Math.Max(top + 60, bottom + dy);
+                manager.ResizeWindow(_dragHandle, left, top, right - left, bottom - top);
+            }
+            Sync();
             args.Handled = true;
             return;
         }
+        SetResizeCursor(IsButtonSource(args.OriginalSource) ? ResizeEdge.None : GetResizeEdge(manager.HitTest(x, y), x, y));
         manager.PointerMove(x, y);
+    }
+
+    private ResizeEdge GetResizeEdge(WindowHit hit, int x, int y)
+    {
+        if (!hit.IsValid || !_visuals.TryGetValue(hit.TopLevelHandle, out var visual)) return ResizeEdge.None;
+        var snapshot = visual.Snapshot;
+        if (!snapshot.Enabled || snapshot.Maximized || (snapshot.Style & Win32.WS_THICKFRAME) == 0) return ResizeEdge.None;
+        var rect = snapshot.Outer;
+        var edge = ResizeEdge.None;
+        if (x < rect.X + 6) edge |= ResizeEdge.Left;
+        else if (x >= rect.Right - 6) edge |= ResizeEdge.Right;
+        if (y < rect.Y + 6) edge |= ResizeEdge.Top;
+        else if (y >= rect.Bottom - 6) edge |= ResizeEdge.Bottom;
+        return edge;
+    }
+
+    private void SetResizeCursor(ResizeEdge edge)
+    {
+        var shape = edge switch
+        {
+            ResizeEdge.Left or ResizeEdge.Right => InputSystemCursorShape.SizeWestEast,
+            ResizeEdge.Top or ResizeEdge.Bottom => InputSystemCursorShape.SizeNorthSouth,
+            ResizeEdge.TopLeft or ResizeEdge.BottomRight => InputSystemCursorShape.SizeNorthwestSoutheast,
+            ResizeEdge.TopRight or ResizeEdge.BottomLeft => InputSystemCursorShape.SizeNortheastSouthwest,
+            _ => InputSystemCursorShape.Arrow
+        };
+        if (_cursorShape == shape) return;
+        if (!_cursors.TryGetValue(shape, out var cursor))
+            _cursors.Add(shape, cursor = InputSystemCursor.Create(shape));
+        ProtectedCursor = cursor;
+        _cursorShape = shape;
     }
 
     private void OnPointerReleased(object sender, PointerRoutedEventArgs args)
@@ -520,7 +657,7 @@ public sealed partial class DwmCompositor : UserControl
             manager.MouseUp(x, y, _pressedButton);
             _pressedButton = -1;
         }
-        _dragHandle = 0;
+        EndDrag();
         ReleasePointerCapture(args.Pointer);
         args.Handled = true;
     }
@@ -541,6 +678,7 @@ public sealed partial class DwmCompositor : UserControl
     private void OnPointerExited(object sender, PointerRoutedEventArgs args)
     {
         if (_dragHandle == 0 && _pressedButton < 0) _manager?.PointerLeave();
+        if (_dragHandle == 0) SetResizeCursor(ResizeEdge.None);
     }
 
     private void OnPointerCanceled(object sender, PointerRoutedEventArgs args) => ResetPointerState();
@@ -554,8 +692,21 @@ public sealed partial class DwmCompositor : UserControl
             var (x, y) = _manager?.GetCursorPosition() ?? (0, 0);
             _manager?.MouseUp(x, y, _pressedButton);
         }
-        _dragHandle = 0;
+        EndDrag();
         _pressedButton = -1;
+    }
+
+    private void EndDrag()
+    {
+        if (_dragHandle != 0)
+        {
+            _manager?.PostMessage(_dragHandle, Win32.WM_EXITSIZEMOVE, 0, 0);
+            if (_resizeEdge != ResizeEdge.None && _manager is { } manager && manager.GetWindowRect(_dragHandle, out var rect, out _))
+                AppRuntime.Log.Info($"desktop window resized: hwnd=0x{_dragHandle:X}, rect={rect}");
+        }
+        _dragHandle = 0;
+        _resizeEdge = ResizeEdge.None;
+        SetResizeCursor(ResizeEdge.None);
     }
 
     private static bool IsButtonSource(object source)

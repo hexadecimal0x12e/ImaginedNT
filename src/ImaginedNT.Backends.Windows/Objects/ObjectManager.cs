@@ -3,7 +3,7 @@ using ImaginedNT.Core.Diagnostics;
 namespace ImaginedNT.Core.Objects;
 
 /// <summary>
-/// A small, per-process NT object namespace.  Directories, symbolic links and named
+/// A runtime-wide NT object namespace.  Directories, symbolic links and named
 /// synchronisation objects live here.  Paths are case-insensitive and rooted at "\".
 /// </summary>
 public sealed class ObjectManager : IDisposable
@@ -53,7 +53,7 @@ public sealed class ObjectManager : IDisposable
 
     public DirectoryObject EnsureDirectory(string path)
     {
-        path = NormalizePath(path);
+        path = ResolveParentPath(path, includeFinal: true);
         lock (_gate)
         {
             if (_objects.TryGetValue(path, out var existing) && existing is DirectoryObject dir) return dir;
@@ -74,7 +74,7 @@ public sealed class ObjectManager : IDisposable
 
     public SymbolicLinkObject CreateSymbolicLink(string path, string target, bool overwrite = false)
     {
-        path = NormalizePath(path);
+        path = ResolveParentPath(path);
         lock (_gate)
         {
             if (_objects.TryGetValue(path, out var existing))
@@ -93,12 +93,12 @@ public sealed class ObjectManager : IDisposable
 
     public void CreateObject(string path, NtObject obj, bool overwrite = false)
     {
-        path = NormalizePath(path);
+        path = ResolveParentPath(path);
         lock (_gate)
         {
             if (_objects.ContainsKey(path) && !overwrite)
                 throw new InvalidOperationException($"object already exists: {path}");
-            EnsureDirectory(GetParent(path));
+            if (Resolve(GetParent(path)) is not { IsContainer: true }) EnsureDirectory(GetParent(path));
             if (_objects.TryGetValue(path, out var existing))
             {
                 existing.Release();
@@ -142,7 +142,7 @@ public sealed class ObjectManager : IDisposable
     /// <summary>Resolve every symbolic link in the path, including relative link targets.</summary>
     public NtObject? Resolve(string path)
     {
-        path = NormalizePath(path);
+        path = ResolveParentPath(path);
         for (var iteration = 0; iteration < 32; iteration++)
         {
             lock (_gate)
@@ -181,11 +181,11 @@ public sealed class ObjectManager : IDisposable
 
     public bool Delete(string path)
     {
-        path = NormalizePath(path);
+        path = ResolveParentPath(path);
         lock (_gate)
         {
             if (!_objects.TryGetValue(path, out var obj)) return false;
-            if (obj is DirectoryObject)
+            if (obj.IsContainer)
             {
                 var prefix = path == "\\" ? "\\" : path + "\\";
                 if (_objects.Keys.Any(k => k.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && !string.Equals(k, path, StringComparison.OrdinalIgnoreCase)))
@@ -194,6 +194,47 @@ public sealed class ObjectManager : IDisposable
             _objects.Remove(path);
             obj.Release();
             return true;
+        }
+    }
+
+    // 保留末级符号链接本身，仅展开父目录中的链接，供创建、打开和删除共用。
+    private string ResolveParentPath(string path, bool includeFinal = false)
+    {
+        path = NormalizePath(path);
+        lock (_gate)
+        {
+            for (var iteration = 0; iteration < 32; iteration++)
+            {
+                var replaced = false;
+                for (var i = 1; i <= path.Length; i++)
+                {
+                    if (i == path.Length ? !includeFinal : path[i] != '\\') continue;
+                    if (!_objects.TryGetValue(path[..i], out var obj) || obj is not SymbolicLinkObject link)
+                        continue;
+                    var target = link.Target.StartsWith('\\') ? link.Target : Combine(GetParent(path[..i]), link.Target);
+                    path = NormalizePath(target + path[i..]);
+                    replaced = true;
+                    break;
+                }
+                if (!replaced) return path;
+            }
+        }
+        throw new InvalidOperationException($"symbolic link loop while resolving {path}");
+    }
+
+    public void DeleteTree(string path)
+    {
+        path = ResolveParentPath(path);
+        if (path == "\\") throw new ArgumentException("cannot delete the root namespace", nameof(path));
+        lock (_gate)
+        {
+            foreach (var key in _objects.Keys.Where(k => string.Equals(k, path, StringComparison.OrdinalIgnoreCase) ||
+                         k.StartsWith(path + "\\", StringComparison.OrdinalIgnoreCase)).ToArray())
+            {
+                var obj = _objects[key];
+                _objects.Remove(key);
+                obj.Release();
+            }
         }
     }
 

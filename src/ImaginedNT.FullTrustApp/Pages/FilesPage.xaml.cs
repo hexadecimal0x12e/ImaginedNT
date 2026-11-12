@@ -48,6 +48,9 @@ public sealed partial class FilesPage : Page
         if (!AppRuntime.IsRunning || session != AppRuntime.Session || path != _filePath) return;
         _files = result.Files;
         _filePath = result.Path;
+        var drives = fs.Drives.Select(d => d.RootPath).OrderBy(d => d, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (FileDriveInput.ItemsSource is not string[] old || !old.SequenceEqual(drives)) FileDriveInput.ItemsSource = drives;
+        FileDriveInput.SelectedItem = drives.FirstOrDefault(d => _filePath.StartsWith(d, StringComparison.OrdinalIgnoreCase));
         SandboxPathText.Text = string.Join("　·　", fs.Drives.Select(d => $"{d.RootPath} → {d.HostDirectory}"));
         if (FilePathInput.FocusState != FocusState.Keyboard) FilePathInput.Text = _filePath;
         PageRows.Set(FileList, _files.Select(f => $"{(f.IsDirectory ? "[目录]" : "[文件]")} {f.Name}\n{(f.IsDirectory ? "" : f.Length.ToString("N0") + " B　")}{f.Modified:yyyy-MM-dd HH:mm:ss}"));
@@ -63,6 +66,13 @@ public sealed partial class FilesPage : Page
     }
 
     private async void OnFileGoClicked(object sender, RoutedEventArgs args) => await GoToFilePathAsync();
+
+    private async void OnFileDriveChanged(object sender, SelectionChangedEventArgs args)
+    {
+        if (FileDriveInput.SelectedItem is not string root || _filePath.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return;
+        FilePathInput.Text = root;
+        await GoToFilePathAsync();
+    }
 
     private async void OnFilePathKeyDown(object sender, KeyRoutedEventArgs args)
     {

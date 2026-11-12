@@ -331,7 +331,7 @@ public static partial class FileApis
                 ctx.Runtime.Trace.Emit(ImaginedNT.Core.Diagnostics.TraceKind.File,
                     $"GetFileAttributesW(0x{ctx.Arg(0):X} '{path}') cwd='{ctx.Process.CurrentDirectory}' caller=0x{ctx.ReturnAddress:X16}",
                     ctx.Process.Id, ctx.Thread.Id);
-            var host = ctx.Process.FileSystem.MapPath(path, ctx.Process.CurrentDirectory);
+            var host = ctx.Process.FileSystem.MapMetadataPath(path, ctx.Process.CurrentDirectory);
             if (HostFileSystem.DirectoryExists(host)) return FILE_ATTRIBUTE_DIRECTORY;
             if (HostFileSystem.FileExists(host)) return 0x80;
             ctx.SetLastError(Win32Error.FileNotFound);
@@ -352,7 +352,7 @@ public static partial class FileApis
             return BoolResult(ctx, false, Win32Error.InvalidParameter);
         try
         {
-            var host = ctx.Process.FileSystem.MapPath(path, ctx.Process.CurrentDirectory);
+            var host = ctx.Process.FileSystem.MapMetadataPath(path, ctx.Process.CurrentDirectory);
             var attributes = HostFileSystem.GetAttributes(host);
             var directory = (attributes & FileAttributes.Directory) != 0;
             var info = HostFileSystem.GetInfo(host);
@@ -473,8 +473,7 @@ public static partial class FileApis
 
         if (normalized.IndexOfAny(['*', '?']) < 0 && !caseSensitive)
         {
-            _ = ctx.Process.FileSystem.MapPath(normalized, currentDirectory, FileOperation.Enum);
-            var host = ctx.Process.FileSystem.MapPath(normalized, currentDirectory);
+            var host = ctx.Process.FileSystem.MapPath(normalized, currentDirectory, FileOperation.Enum);
             // FindFirstFileW takes a file-name pattern, not a bare directory path.  Windows
             // returns ERROR_FILE_NOT_FOUND for "C:\", "C:" and for "."/".." components; treating
             // them as "enumerate everything" makes cmd.exe interpret the first entry as the
@@ -512,7 +511,7 @@ public static partial class FileApis
             else if (directoryPart.EndsWith(':')) directoryPart += "\\";
         }
 
-        var directoryHost = ctx.Process.FileSystem.MapPath(directoryPart, currentDirectory);
+        var directoryHost = ctx.Process.FileSystem.MapPath(directoryPart, currentDirectory, FileOperation.Enum);
         if (!HostFileSystem.DirectoryExists(directoryHost)) throw new NtFileException(NtStatus.ObjectNameNotFound, pattern);
         return ctx.Process.FileSystem.Enumerate(directoryPart, currentDirectory).Where(i => MatchesFindPattern(namePattern, i.Name, caseSensitive)).Select(i => CreateEntry(i, i.Name)).ToArray();
     }
@@ -832,7 +831,7 @@ public static partial class FileApis
         if (string.IsNullOrEmpty(path)) return NtStatus.ObjectNameInvalid;
         try
         {
-            var host = ctx.Process.FileSystem.MapPath(path, ctx.Process.CurrentDirectory);
+            var host = ctx.Process.FileSystem.MapMetadataPath(path, ctx.Process.CurrentDirectory);
             var info = HostFileSystem.FileExists(host) ? HostFileSystem.GetInfo(host) : HostFileSystem.DirectoryExists(host) ? null : throw new NtFileException(NtStatus.ObjectNameNotFound, path);
             var buffer = ctx.Arg(1);
             if (buffer != 0) WriteBasicInformation(ctx, buffer, host, info);
@@ -849,7 +848,7 @@ public static partial class FileApis
         if (string.IsNullOrEmpty(path)) return NtStatus.ObjectNameInvalid;
         try
         {
-            var host = ctx.Process.FileSystem.MapPath(path, ctx.Process.CurrentDirectory);
+            var host = ctx.Process.FileSystem.MapMetadataPath(path, ctx.Process.CurrentDirectory);
             if (!HostFileSystem.FileExists(host) && !HostFileSystem.DirectoryExists(host)) return NtStatus.ObjectNameNotFound;
             var buffer = ctx.Arg(1);
             if (buffer != 0) WriteNetworkOpenInformation(ctx, buffer, host);

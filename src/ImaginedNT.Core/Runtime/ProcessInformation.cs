@@ -10,6 +10,7 @@ public sealed class ProcessInformation
 
     public int Id { get; }
     public int ParentId { get; }
+    public uint SessionId { get; }
     public string Name { get; }
     public string ImagePath { get; }
     public string CommandLine { get; }
@@ -18,12 +19,15 @@ public sealed class ProcessInformation
     public int HandleCount { get; }
     public int Priority => 8;
     public bool IsSystem => Id == SystemProcessId;
+    public bool IsImaginedProcess { get; }
     public IReadOnlyList<ImaginedThread> Threads { get; }
     public RuntimeMemorySnapshot Memory { get; }
 
     public ProcessInformation(ImaginedProcess process)
     {
         Id = process.Id;
+        IsImaginedProcess = process.IsImaginedProcess;
+        SessionId = process.SessionId;
         ParentId = process.ParentId ?? 0;
         Name = Path.GetFileName(process.ImagePath);
         ImagePath = process.ImagePath;

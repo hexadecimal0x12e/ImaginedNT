@@ -16,7 +16,11 @@ public sealed unsafe class IatThunkAllocator : IDisposable
     public const int PageSize = 0x10000;
     public const int LauncherOffset = 0x100;
     public const int RestoreStubOffset = 0x300;
-    public const int ApiStubsOffset = 0x400;
+    private const int LauncherFunctionTableOffset = 0x400;
+    private const int LauncherUnwindOffset = 0x420;
+    private const int ExceptionHandlerUnwindOffset = 0x470;
+    private const int ExceptionHandlerOffset = 0x480;
+    public const int ApiStubsOffset = 0x600;
     public const int StubSize = 16;
     public const int ThreadTrampolineOffset = 0x8000;
     // Initial-page capacity; additional API pages are allocated on demand.
@@ -73,7 +77,7 @@ public sealed unsafe class IatThunkAllocator : IDisposable
             Buffer.MemoryCopy(p, (void*)(long)_pageAddress, PageSize, stub.Length);
         }
 
-        var launcher = X64StubEmitter.EmitGuestLauncher();
+        var launcher = X64StubEmitter.EmitGuestLauncher(ExceptionHandlerOffset, out var unwindInfo, out var landingOffset);
         if (launcher.Length > RestoreStubOffset - LauncherOffset)
             throw new InvalidOperationException("guest launcher overlaps the restore stub");
         _launcherAddress = _pageAddress + LauncherOffset;
@@ -85,7 +89,7 @@ public sealed unsafe class IatThunkAllocator : IDisposable
             (IntPtr)(long)_launcherAddress, (UIntPtr)launcher.Length);
 
         var restore = X64StubEmitter.EmitThreadRestoreStub();
-        if (restore.Length > ApiStubsOffset - RestoreStubOffset)
+        if (restore.Length > LauncherFunctionTableOffset - RestoreStubOffset)
             throw new InvalidOperationException("thread restore stub overlaps the API stub arena");
         _restoreStubAddress = _pageAddress + RestoreStubOffset;
         fixed (byte* p = restore)
@@ -94,6 +98,25 @@ public sealed unsafe class IatThunkAllocator : IDisposable
         }
         NativeMethods.FlushInstructionCache(NativeMethods.GetCurrentProcess(),
             (IntPtr)(long)_restoreStubAddress, (UIntPtr)restore.Length);
+
+        var unwindAddress = NativeMethods.GetProcAddress(NativeMethods.GetModuleHandleW("ntdll.dll"), "RtlUnwindEx");
+        if (unwindAddress == IntPtr.Zero) throw new EntryPointNotFoundException("ntdll!RtlUnwindEx");
+        var handler = X64StubEmitter.EmitGuestExceptionHandler(_launcherAddress + (ulong)landingOffset, (ulong)unwindAddress);
+        if (unwindInfo.Length > ExceptionHandlerUnwindOffset - LauncherUnwindOffset || handler.Length > ApiStubsOffset - ExceptionHandlerOffset)
+            throw new InvalidOperationException("guest exception handler overlaps the thunk arena");
+        Marshal.Copy(unwindInfo, 0, (nint)(_pageAddress + LauncherUnwindOffset), unwindInfo.Length);
+        Marshal.Copy(handler, 0, (nint)(_pageAddress + ExceptionHandlerOffset), handler.Length);
+        Marshal.Copy(new byte[] { 1, 4, 1, 0, 4, 0x62, 0, 0 }, 0, (nint)(_pageAddress + ExceptionHandlerUnwindOffset), 8);
+        var table = (uint*)(_pageAddress + LauncherFunctionTableOffset);
+        table[0] = LauncherOffset;
+        table[1] = LauncherOffset + (uint)launcher.Length;
+        table[2] = LauncherUnwindOffset;
+        table[3] = ExceptionHandlerOffset;
+        table[4] = ExceptionHandlerOffset + (uint)handler.Length;
+        table[5] = ExceptionHandlerUnwindOffset;
+        if (!NativeMethods.RtlAddFunctionTable((nint)table, 2, _pageAddress))
+            throw new InvalidOperationException("guest launcher unwind registration failed");
+        NativeMethods.FlushInstructionCache(NativeMethods.GetCurrentProcess(), (nint)_pageAddress, (UIntPtr)ApiStubsOffset);
 
         _nextStub = 0;
         _trace?.Emit(TraceKind.Info,
@@ -278,6 +301,7 @@ public sealed unsafe class IatThunkAllocator : IDisposable
             _nativePages.Clear();
             if (_pageAddress != 0)
             {
+                NativeMethods.RtlDeleteFunctionTable((nint)(_pageAddress + LauncherFunctionTableOffset));
                 NativeMethods.VirtualFree((IntPtr)(long)_pageAddress, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
             }
         }

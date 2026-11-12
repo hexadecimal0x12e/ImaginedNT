@@ -5,6 +5,8 @@ using ImaginedNT.Core.Runtime;
 [assembly: PartiallyImaginedNativeApi("api-ms-win-crt-private-l1-1-0.dll", "__C_specific_handler", ApiCategory.Process, "ucrtbase!__C_specific_handler")]
 [assembly: PartiallyImaginedNativeApi("api-ms-win-crt-private-l1-1-0.dll", "_CxxThrowException", ApiCategory.Process,
     "ucrtbase!_CxxThrowException", "vcruntime140!_CxxThrowException")]
+[assembly: PartiallyImaginedNativeApi("api-ms-win-crt-private-l1-1-0.dll", "__CxxFrameHandler3", ApiCategory.Process,
+    "ucrtbase!__CxxFrameHandler3", "vcruntime140!__CxxFrameHandler3", "msvcrt!__CxxFrameHandler3")]
 [assembly: PartiallyImaginedNativeApi("api-ms-win-crt-private-l1-1-0.dll", "__CxxFrameHandler4", ApiCategory.Process,
     "ucrtbase!__CxxFrameHandler4", "vcruntime140_1!__CxxFrameHandler4")]
 [assembly: PartiallyImaginedNativeApi("api-ms-win-crt-private-l1-1-0.dll", "__C_specific_handler_noexcept", ApiCategory.Process,

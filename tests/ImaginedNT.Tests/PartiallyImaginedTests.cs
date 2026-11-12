@@ -30,11 +30,10 @@ internal static class PartiallyImaginedTests
         Assert.False(registry.TryGet("partial-a", "NativeOnly", out _), "native part does not inherit unrelated APIs");
     }
 
-    private static ImaginedRuntime CreateRuntime(ImportPolicy policy = ImportPolicy.ManagedFirst)
+    private static ImaginedRuntime CreateRuntime()
     {
         var options = RuntimeOptions.ForTests();
         options.InterceptSyscalls = false;
-        options.ImportPolicy = policy;
         options.FailOnUnresolvedImport = true;
         return new ImaginedRuntime(options, new[] { typeof(PartiallyImaginedTests).Assembly });
     }
@@ -53,29 +52,26 @@ internal static class PartiallyImaginedTests
         try
         {
             var path = WriteLibrary(directory, "partial-a.dll");
-            foreach (var policy in new[] { ImportPolicy.ManagedFirst, ImportPolicy.NativeFirst })
+            using var runtime = CreateRuntime();
+            foreach (var _ in new[] { 0, 1 })
             {
-                using var runtime = CreateRuntime(policy);
-                foreach (var _ in new[] { 0, 1 })
-                {
-                    var process = runtime.CreateProcess(path);
-                    var mapped = process.LoadManagedLibrary(path)!;
-                    Assert.Equal(0UL, mapped.EntryPoint, "DLL without DllMain");
-                    Assert.Equal((uint)process.Id, Call(process, mapped.BaseAddress + 0x1000), "raw export entry");
-                    Assert.Equal((uint)process.Id, Call(process, mapped.BaseAddress + 0x1010), "relative internal call");
-                    Assert.Equal(42u, Call(process, mapped.BaseAddress + 0x1006), "adjacent native function preserved");
-                    var named = runtime.ResolveExport(process, mapped.BaseAddress, "Replace");
-                    Assert.Equal(named, runtime.ResolveExport(process, mapped.BaseAddress, "Alias"), "named alias");
-                    Assert.Equal(named, runtime.ResolveExport(process, mapped.BaseAddress, null, 1), "ordinal alias");
-                    Assert.Equal((uint)process.Id, Call(process, named), "dynamic replacement");
-                    runtime.Options.ImportPolicy = ImportPolicy.ManagedOnly;
-                    // Guest-mapped exports are guest code, not host native forwards; they remain
-                    // callable under managed-only/strict policy (see ResolveMappedExport).
-                    Assert.NotEqual(0UL, runtime.ResolveExport(process, mapped.BaseAddress, "Tiny"),
-                        "guest export remains callable under managed-only");
-                    Assert.Equal(named, runtime.ResolveExport(process, mapped.BaseAddress, "Replace"), "managed part remains available");
-                    runtime.Options.ImportPolicy = policy;
-                }
+                var process = runtime.CreateProcess(path);
+                var mapped = process.LoadManagedLibrary(path)!;
+                Assert.Equal(0UL, mapped.EntryPoint, "DLL without DllMain");
+                Assert.Equal((uint)process.Id, Call(process, mapped.BaseAddress + 0x1000), "raw export entry");
+                Assert.Equal((uint)process.Id, Call(process, mapped.BaseAddress + 0x1010), "relative internal call");
+                Assert.Equal(42u, Call(process, mapped.BaseAddress + 0x1006), "adjacent native function preserved");
+                var named = runtime.ResolveExport(process, mapped.BaseAddress, "Replace");
+                Assert.Equal(named, runtime.ResolveExport(process, mapped.BaseAddress, "Alias"), "named alias");
+                Assert.Equal(named, runtime.ResolveExport(process, mapped.BaseAddress, null, 1), "ordinal alias");
+                Assert.Equal((uint)process.Id, Call(process, named), "dynamic replacement");
+                runtime.Options.ImportPolicy = ImportPolicy.ManagedOnly;
+                // Guest-mapped exports are guest code, not host native forwards; they remain
+                // callable under managed-only/strict policy (see ResolveMappedExport).
+                Assert.NotEqual(0UL, runtime.ResolveExport(process, mapped.BaseAddress, "Tiny"),
+                    "guest export remains callable under managed-only");
+                Assert.Equal(named, runtime.ResolveExport(process, mapped.BaseAddress, "Replace"), "managed part remains available");
+                runtime.Options.ImportPolicy = ImportPolicy.ManagedFirst;
             }
         }
         finally { Directory.Delete(directory, true); }
@@ -88,7 +84,7 @@ internal static class PartiallyImaginedTests
         {
             var a = WriteLibrary(directory, "partial-a.dll", "partial-b.dll");
             var b = WriteLibrary(directory, "partial-b.dll", "partial-a.dll");
-            using var runtime = CreateRuntime(ImportPolicy.NativeFirst);
+            using var runtime = CreateRuntime();
             runtime.RegisterLibrary(a);
             runtime.RegisterLibrary(b);
             var process = runtime.CreateProcess(a);

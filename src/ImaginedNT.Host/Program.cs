@@ -80,6 +80,7 @@ public static class Program
               --sandbox <dir>       Host directory that backs C:\ (default: ./sandbox/process-<pid>)
               --drive D=<dir>       Map a drive to a directory or YAML; bare YAML uses a free drive
               --packaged            Simulate MSIX package identity using default/configured fields
+              --session <id>        Run in a virtual NT session (default: 0)
               --unpackaged          Simulate a process without package identity (default)
               --package-identity <json> Load package identity from a JSON file and enable simulation
               --host-system-dlls    Resolve by-name system imports from the host System32 instead of the sandbox
@@ -105,7 +106,8 @@ public static class Program
               --job                 Apply an OS job object (memory limit, kill-on-close)
               --strict              Managed-only imports, no native forwarding, fail if unresolved
               --native-declared-only  Allow only declared native APIs; fail on anything else
-              --policy <name>       managed-first (default), managed-only, native-first
+              --policy <name>       managed-first (default), managed-only
+              --no-native-fallback  Disable undeclared native fallback; keep declared native forwards
               --native-policy <name> allow-all (default), declared-only
               --no-exec             Load and patch the image, then stop (safe inspection)
               --base <hex>          Force a load base (relocations are applied when possible)
@@ -241,6 +243,11 @@ public static class Program
                 case "--packaged":
                     options.IsPackaged = true;
                     break;
+                case "--session":
+                    if (!uint.TryParse(RequireValue(args, ref i, arg), out var sessionId) || sessionId == uint.MaxValue)
+                        throw new ArgumentException("--session requires an ID between 0 and 4294967294");
+                    options.DefaultSessionId = sessionId;
+                    break;
                 case "--unpackaged":
                     options.IsPackaged = false;
                     break;
@@ -336,6 +343,9 @@ public static class Program
                 case "--no-native-forward":
                     options.AllowNativeForwarding = false;
                     break;
+                case "--no-native-fallback":
+                    options.AllowUnimplementedApiForwarding = false;
+                    break;
                 case "--fail-on-unresolved":
                     options.FailOnUnresolvedImport = true;
                     break;
@@ -352,7 +362,6 @@ public static class Program
                     {
                         "managed-first" => ImportPolicy.ManagedFirst,
                         "managed-only" => ImportPolicy.ManagedOnly,
-                        "native-first" => ImportPolicy.NativeFirst,
                         var value => throw new ArgumentException($"unknown policy: {value}")
                     };
                     break;

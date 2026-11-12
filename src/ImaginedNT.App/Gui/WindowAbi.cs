@@ -100,6 +100,8 @@ internal static class Win32
     public const uint WM_MOUSEWHEEL = 0x020A;
     public const uint WM_PARENTNOTIFY = 0x0210;
     public const uint WM_CAPTURECHANGED = 0x0215;
+    public const uint WM_ENTERSIZEMOVE = 0x0231;
+    public const uint WM_EXITSIZEMOVE = 0x0232;
     public const uint WM_MOUSELEAVE = 0x02A3;
     public const uint WM_NCMOUSELEAVE = 0x02A2;
     public const uint WM_DPICHANGED = 0x02E0;

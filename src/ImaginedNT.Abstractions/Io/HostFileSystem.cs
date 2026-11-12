@@ -93,17 +93,17 @@ public static class HostFileSystem
             if (GetGrantedAccess(path) is { } granted) return granted.TryGetInfo(path)?.IsDirectory == directory;
             try
             {
-                Debug.WriteLine($"Finding {path} {directory}");
+                //Debug.WriteLine($"Finding {path} {directory}");
                 if (directory ? Directory.Exists(path) : File.Exists(path))
                 {
-                    Debug.WriteLine($"found {path}");
+                    //Debug.WriteLine($"found {path}");
                     return true;
                 }
             }
             catch { }
             if(GetInfo(path).IsDirectory == directory)
             {
-                Debug.WriteLine($"found {path}");
+                //Debug.WriteLine($"found {path}");
                 return true;
             }
             else
@@ -112,7 +112,7 @@ public static class HostFileSystem
                 return false;
             }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { Debug.WriteLine($"not found {path}: {ex}"); return false; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { Debug.WriteLine($"not found {path}"); return false; }
     }
 
     public static HostFileInfo GetInfo(string path)

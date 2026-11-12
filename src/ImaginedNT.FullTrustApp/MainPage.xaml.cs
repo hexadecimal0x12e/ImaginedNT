@@ -19,13 +19,16 @@ public sealed partial class MainPage : Page
         {
             ["terminal"] = new TerminalPage(),
             ["desktop"] = new DesktopPage(),
+            ["stations"] = new WindowStationsPage(),
             ["processes"] = new ProcessesPage(),
+            ["objects"] = new ObjectsPage(),
             ["files"] = new FilesPage(),
             ["registry"] = new RegistryPage(),
             ["logs"] = new LogsPage(),
             ["sandbox"] = new SandboxPage(),
             ["settings"] = new RuntimeSettingsPage()
         };
+        AppRuntime.BugChecked += OnBugChecked;
         AppRuntime.Changed += UpdateHeader;
         AppRuntime.NavigationRequested += Navigate;
         _timer.Tick += OnTick;
@@ -76,6 +79,8 @@ public sealed partial class MainPage : Page
             switch (PageHost.Content)
             {
                 case ProcessesPage processes: processes.Refresh(); break;
+                case WindowStationsPage stations: stations.Refresh(); break;
+                case ObjectsPage objects: objects.Refresh(); break;
                 case FilesPage files: await files.RefreshAsync(); break;
                 case RegistryPage registry: await registry.RefreshAsync(); break;
                 case LogsPage logs: logs.Refresh(); break;
@@ -83,6 +88,22 @@ public sealed partial class MainPage : Page
         }
         catch (Exception ex) { AppRuntime.ReportError("读取运行时状态", ex); }
     }
+
+    private void OnBugChecked(string message) => DispatcherQueue.TryEnqueue(async () =>
+    {
+        try
+        {
+            _ = AppRuntime.StopAsync();
+            await new ContentDialog
+            {
+                XamlRoot = XamlRoot,
+                Title = "发生了一个不可恢复错误（蓝屏）",
+                Content = $"{message}",
+                CloseButtonText = "确定"
+            }.ShowAsync();
+        }
+        catch (Exception ex) { AppRuntime.ReportError("显示蓝屏提示", ex); }
+    });
 
     private void UpdateHeader()
     {
@@ -96,6 +117,7 @@ public sealed partial class MainPage : Page
         try { await AppRuntime.ShutdownAsync(); }
         finally
         {
+            AppRuntime.BugChecked -= OnBugChecked;
             AppRuntime.Changed -= UpdateHeader;
             AppRuntime.NavigationRequested -= Navigate;
         }

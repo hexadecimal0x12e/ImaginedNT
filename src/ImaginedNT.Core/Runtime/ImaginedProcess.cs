@@ -23,6 +23,7 @@ public sealed class ImaginedProcess : IDisposable
     internal FiberLocalStorage Fls { get; } = new();
     private readonly object _threadGate = new();
     private readonly object _exitGate = new();
+    private readonly object _disposeGate = new();
     private readonly object _moduleGate = new();
     private readonly object _heapGate = new();
     private readonly object _tlsGate = new();
@@ -50,14 +51,22 @@ public sealed class ImaginedProcess : IDisposable
     private ulong _commandLineBuffer;
     private bool _started;
     private bool _disposed;
+    private volatile bool _disposeRequested;
+    private readonly Func<ImaginedProcessContext, CancellationToken, Task<int>>? _entryPoint;
     private int? _faultExitCode;
     private DateTimeOffset _startTime;
 
     internal ImaginedProcess(ImaginedRuntime runtime, int id, string imagePath, string commandLine, string currentDirectory,
-        int? parentId, string sandboxRoot, IReadOnlyDictionary<string, string> environment, bool isRoot)
+        int? parentId, string sandboxRoot, IReadOnlyDictionary<string, string> environment, bool isRoot, SessionInformation session,
+        DesktopObject desktop, Func<ImaginedProcessContext, CancellationToken, Task<int>>? entryPoint = null)
     {
+        _entryPoint = entryPoint;
         Runtime = runtime;
         Id = id;
+        SessionId = session.Id;
+        StartupDesktop = desktop;
+        WindowStation = desktop.WindowStation;
+        BaseNamedObjectsPath = session.BaseNamedObjectsPath;
         _pid = id;
         _options = runtime.Options;
         PackageIdentity = parentId is int parent
@@ -100,14 +109,30 @@ public sealed class ImaginedProcess : IDisposable
 
         InitializeStandardHandles();
         Trace.Emit(TraceKind.Process,
-            $"created imagined process {id} image='{ImagePath}' sandbox='{FileSystem.Root}' parent={(parentId?.ToString() ?? "<host>")} root={isRoot} package='{PackageIdentity?.FullName ?? "<none>"}'", id);
+            $"created imagined process {id} session={SessionId} image='{ImagePath}' sandbox='{FileSystem.Root}' parent={(parentId?.ToString() ?? "<host>")} root={isRoot} package='{PackageIdentity?.FullName ?? "<none>"}'", id);
     }
 
     public ImaginedRuntime Runtime { get; }
     public PackageIdentity? PackageIdentity { get; }
     public int Id { get; }
+    public uint SessionId { get; }
+    public WindowStationObject WindowStation { get; internal set; }
+    public ulong WindowStationHandle { get; internal set; }
+    public DesktopObject StartupDesktop { get; }
+    public string BaseNamedObjectsPath { get; }
+
+    public string GetNamedObjectPath(string name)
+    {
+        if (name.StartsWith('\\')) return ObjectManager.NormalizePath(name);
+        if (name.StartsWith("Global\\", StringComparison.Ordinal))
+            return ObjectManager.Combine(@"\BaseNamedObjects", name[7..]);
+        if (name.StartsWith("Local\\", StringComparison.Ordinal)) name = name[6..];
+        return ObjectManager.Combine(BaseNamedObjectsPath, name);
+    }
     public int? ParentId { get; internal set; }
     public bool IsRoot => _isRoot;
+    public bool IsImaginedProcess => _entryPoint is not null;
+    public bool CancellationRequested => IsImaginedProcess && MainThread?.TerminationRequested == true;
     public string ImagePath { get; }
     public string CommandLine { get; }
     public string CurrentDirectory { get; set; }
@@ -196,6 +221,7 @@ public sealed class ImaginedProcess : IDisposable
         get { lock (_exitGate) return _faultExitCode; }
     }
     internal bool HasRunningThreads => Threads.Any(t => t.IsExecutionActive);
+    internal bool DisposalRequested => _disposeRequested;
     public IReadOnlyList<ImaginedThread> Threads
     {
         get { lock (_threadGate) return _threads.ToArray(); }
@@ -529,6 +555,7 @@ public sealed class ImaginedProcess : IDisposable
 
     public PeMappedImage LoadImage(string path, ulong forcedBase = 0)
     {
+        if (IsImaginedProcess) throw new InvalidOperationException("a managed imagined process does not load a main PE image");
         lock (_moduleGate)
         {
             if (Image is not null) throw new InvalidOperationException("this imagined process already has a main image");
@@ -567,11 +594,20 @@ public sealed class ImaginedProcess : IDisposable
     public ImaginedThread EnsureMainThread(bool suspended = true)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (Image is null) throw new InvalidOperationException("no image has been loaded");
         lock (_threadGate)
         {
             if (_mainThread is not null) return _mainThread;
+            if (_entryPoint is not null)
+            {
+                var thread = new ImaginedThread(this, Runtime.NextThreadId(), 0, IntPtr.Zero,
+                    0, 0, true, "imagined-main", managedHosted: true, entryPoint: _entryPoint);
+                _threads.Add(thread);
+                _mainThread = thread;
+                if (!suspended) thread.Start();
+                return thread;
+            }
         }
+        if (Image is null) throw new InvalidOperationException("no image has been loaded");
         return CreateThreadAt(Image.EntryPoint, 0, isMain: true, name: "main", suspended: suspended);
     }
 
@@ -585,13 +621,13 @@ public sealed class ImaginedProcess : IDisposable
     public ProcessExitInfo Run(TimeSpan? timeout = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (Image is null) throw new InvalidOperationException("no image has been loaded");
+        if (Image is null && !IsImaginedProcess) throw new InvalidOperationException("no image has been loaded");
         if (_started) throw new InvalidOperationException("the imagined process has already run");
         _started = true;
         _startTime = DateTimeOffset.UtcNow;
 
-        Runtime.Trace.Emit(TraceKind.Process, $"starting main thread at 0x{Image.EntryPoint:X16}", Id);
-        var main = MainThread ?? CreateThreadAt(Image.EntryPoint, 0, isMain: true, name: "main");
+        Runtime.Trace.Emit(TraceKind.Process, $"starting main thread at 0x{Image?.EntryPoint ?? 0:X16}", Id);
+        var main = EnsureMainThread();
         if (main.State == ThreadState.Created && !main.Start())
         {
             ExitCode ??= -1;
@@ -604,6 +640,11 @@ public sealed class ImaginedProcess : IDisposable
         if (!main.Wait(effectiveTimeout, out var nativeExitCode))
         {
             Runtime.Trace.Error($"process {Id} timed out after {effectiveTimeout.TotalSeconds:0.##}s; terminating", Id);
+            if (IsImaginedProcess)
+            {
+                Terminate(124);
+                return new ProcessExitInfo(ExitCode ?? 124, true, DateTimeOffset.UtcNow - _startTime);
+            }
             ExitCode ??= 124; // conventional timeout exit code, distinct from guest statuses
             SignalExit(ExitCode.Value);
             main.Terminate(ExitCode.Value);
@@ -747,6 +788,12 @@ public sealed class ImaginedProcess : IDisposable
 
     internal void FailFast(uint code, ulong address, string source, uint status = NtStatus.StackBufferOverrun)
     {
+        if (IsImaginedProcess)
+        {
+            Trace.Error($"imagined process fail-fast: code={code} status=0x{status:X8} ({source})", Id);
+            Terminate(unchecked((int)status));
+            return;
+        }
         lock (_exitGate)
         {
             if (_faultExitCode is not null) return;
@@ -842,8 +889,7 @@ public sealed class ImaginedProcess : IDisposable
         if (IsRoot)
         {
             if(_options.WrapFailFast) Environment.FailFast($"The root process has called fail-fast because '{message}' (status=0x{status:X8} at 0x{address:X16}, from {source})");
-            Console.Error.WriteLine($"ImaginedNT: Root process {Path.GetFileName(ImagePath) ?? "<unknown>"} called a fail-fast because '{message}' (status=0x{status:X8} at 0x{address:X16}, from {source})");
-            Environment.Exit(unchecked((int)status));
+            Runtime.StopWithBugCheck($"The root process exited unexpectedly with code {status} because '{message}' (status=0x{status:X8} at 0x{address:X16}, from {source})");
         }
 
         _options.StandardError.Write(System.Text.Encoding.UTF8.GetBytes(
@@ -853,6 +899,13 @@ public sealed class ImaginedProcess : IDisposable
     /// <summary>Terminate the process from the outside (TerminateProcess on a child handle).</summary>
     public void Terminate(int exitCode)
     {
+        if (IsImaginedProcess)
+        {
+            if (IsTerminating || CancellationRequested) return;
+            Trace.Emit(TraceKind.Process, $"requesting cancellation of imagined process {Id} with code {exitCode}", Id);
+            EnsureMainThread().Terminate(exitCode);
+            return;
+        }
         SignalExit(exitCode);
         Trace.Emit(TraceKind.Process, $"terminating process {Id} with code {exitCode}", Id);
         foreach (var thread in Threads)
@@ -866,6 +919,11 @@ public sealed class ImaginedProcess : IDisposable
     /// <summary>Called by ExitProcess.  Root processes follow the configured termination policy.</summary>
     public int RequestProcessExit(int exitCode, ApiCallContext? context = null)
     {
+        if (IsImaginedProcess)
+        {
+            Terminate(exitCode);
+            return ExitCode ?? exitCode;
+        }
         lock (_exitGate) ExitCode ??= exitCode;
         var code = ExitCode ?? exitCode;
         var currentNativeId = Native.NativeMethods.GetCurrentThreadId();
@@ -930,6 +988,8 @@ public sealed class ImaginedProcess : IDisposable
     /// <summary>Called by ExitThread.  Non-main threads leave through the guest's own stack.</summary>
     public uint ExitCurrentThread(int exitCode, ApiCallContext? context = null)
     {
+        if (Runtime.GetCurrentThread() is { IsImaginedEntry: true } imagined && ReferenceEquals(imagined.Process, this))
+            throw new GuestThreadExitException(exitCode);
         var nativeId = Native.NativeMethods.GetCurrentThreadId();
         var thread = FindThreadByNativeId(nativeId) ?? GetOrRegisterHostThread(nativeId);
         Trace.Emit(TraceKind.Thread, $"ExitThread({exitCode})", Id, thread.Id);
@@ -961,16 +1021,20 @@ public sealed class ImaginedProcess : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        SignalExit(0);
+        lock (_disposeGate)
+            if (_disposed) return;
+        _disposeRequested = true;
+        if (IsImaginedProcess)
+            Terminate(0);
+        else
+            SignalExit(0);
 
         var currentNativeId = Native.NativeMethods.GetCurrentThreadId();
         foreach (var thread in Threads)
         {
             try
             {
-                if (thread.NativeId == currentNativeId) continue; // never tear down the caller
+                if (thread.NativeId == currentNativeId || ReferenceEquals(thread, Runtime.GetCurrentThread())) continue;
                 if (thread.State is ThreadState.Running or ThreadState.Created)
                 {
                     if (FaultExitCode is int fault) thread.RequestTermination(fault);
@@ -988,6 +1052,16 @@ public sealed class ImaginedProcess : IDisposable
             Trace.Warn($"process {Id} still has running guest threads; retaining its resources", Id);
             return;
         }
+        lock (_disposeGate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            DisposeResources();
+        }
+    }
+
+    private void DisposeResources()
+    {
         // COM objects hold guest-visible interface blocks and host references; release them before
         // the process address space and sandbox go away.
         try { Runtime.Com.ReleaseProcess(Id); }
@@ -1006,7 +1080,7 @@ public sealed class ImaginedProcess : IDisposable
         foreach (var traps in _failFastInterceptors.Values) traps.Dispose();
         _failFastInterceptors.Clear();
         try { Handles.Dispose(); } catch { }
-        // The object namespace is session-wide and owned by the runtime.
+        // The runtime owns the shared object namespace.
         lock (_heapGate)
         {
             foreach (var heap in _heaps) heap.Dispose();
@@ -1015,6 +1089,7 @@ public sealed class ImaginedProcess : IDisposable
         Runtime.Memory.FreeHostAllocations(Id);
         try { Memory.Dispose(); } catch { }
         try { _job?.Dispose(); } catch { }
+        Runtime.RemoveProcess(this);
         Trace.Emit(TraceKind.Process, $"process {Id} disposed", Id);
     }
 

@@ -75,20 +75,23 @@ public static class X64StubEmitter
     /// trampoline restores that frame and returns through the launcher's epilogue, so the C#
     /// thread finishes normally instead of being killed from inside a managed dispatch frame.
     ///
-    /// Win64 calling convention: rcx = guest entry, rdx = 16 integer arguments, r8 = context slot.
+    /// Win64: rcx = guest entry, rdx = arguments, r8 = context slot, r9 = fault code/address output.
     /// </summary>
-    public static byte[] EmitGuestLauncher()
+    public static byte[] EmitGuestLauncher(uint handlerRva, out byte[] unwindInfo, out int landingOffset)
     {
         var c = new CodeWriter(320);
         EmitPushNonvolatile(c);
         c.Raw(0x48, 0x83, 0xEC, 0x08);                   // sub rsp, 8 (16-byte call alignment)
         c.Raw(0x48, 0x81, 0xEC, 0xA0, 0x00, 0x00, 0x00); // sub rsp, 0xA0 (XMM6-15 save area)
-        EmitSaveXmm(c);
+        var xmmOffsets = new List<byte>(10);
+        EmitSaveXmm(c, xmmOffsets);
+        c.Raw(0x4C, 0x89, 0x8C, 0x24, 0xA0, 0x00, 0x00, 0x00); // mov [rsp+0xA0], r9 (fault output)
         c.Raw(0x49, 0x89, 0x20);                         // mov [r8], rsp
         c.Raw(0x48, 0x89, 0xC8);                         // mov rax, rcx
         c.Raw(0x49, 0x89, 0xD2);                         // mov r10, rdx
         // Keep outgoing arguments and shadow space below the saved registers.
         c.Raw(0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00); // sub rsp, 0x80
+        var prologSize = (byte)c.Length;
         for (var i = 4; i < 16; i++)
         {
             c.Raw(0x4D, 0x8B, 0x5A, (byte)(i * 8));      // mov r11, [r10+offset]
@@ -99,12 +102,50 @@ public static class X64StubEmitter
         c.Raw(0x4D, 0x8B, 0x42, 0x10);                   // mov r8, [r10+16]
         c.Raw(0x4D, 0x8B, 0x4A, 0x18);                   // mov r9, [r10+24]
         c.Raw(0xFF, 0xD0);                               // call rax
+        landingOffset = c.Length;
         c.Raw(0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00); // add rsp, 0x80
         EmitRestoreXmm(c);
         c.Raw(0x48, 0x81, 0xC4, 0xA0, 0x00, 0x00, 0x00); // add rsp, 0xA0
         c.Raw(0x48, 0x83, 0xC4, 0x08);                   // add rsp, 8
         EmitPopNonvolatile(c);
         c.Raw(0xC3);                                     // ret
+
+        // UNWIND_INFO follows the prologue in reverse: outgoing arguments, XMM saves,
+        // XMM storage, alignment, then the eight nonvolatile integer registers.
+        var u = new CodeWriter(72);
+        u.Raw(0x09, prologSize, 32, 0);                   // version 1, exception handler, 32 unwind slots
+        u.Raw(prologSize, 0xF2);                         // UWOP_ALLOC_SMALL: 0x80
+        for (var reg = 15; reg >= 6; reg--)
+        {
+            u.Raw(xmmOffsets[reg - 6], (byte)((reg << 4) | 8)); // UWOP_SAVE_XMM128
+            u.Raw((byte)(reg - 6), 0);
+        }
+        u.Raw(23, 0x01, 20, 0, 16, 0x02);               // UWOP_ALLOC_LARGE: 0xA0; UWOP_ALLOC_SMALL: 8
+        u.Raw(12, 0xF0, 10, 0xE0, 8, 0xD0, 6, 0xC0, 4, 0x70, 3, 0x60, 2, 0x50, 1, 0x30);
+        u.I32((int)handlerRva);
+        unwindInfo = u.ToArray();
+        return c.ToArray();
+    }
+
+    public static byte[] EmitGuestExceptionHandler(ulong landingAddress, ulong unwindAddress)
+    {
+        var c = new CodeWriter(112);
+        c.Raw(0x48, 0x83, 0xEC, 0x38);                   // sub rsp, 0x38
+        c.Raw(0xF6, 0x41, 0x04, 0x06, 0x75, 0x53);       // ignore unwind/exit-unwind dispatches
+        c.Raw(0x81, 0x39, 0x63, 0x73, 0x6D, 0xE0, 0x75, 0x4B); // only MSVC C++ exceptions
+        c.Raw(0x4C, 0x8B, 0x92, 0x20, 0x01, 0x00, 0x00); // mov r10, [rdx+0x120] (fault output)
+        c.Raw(0x4D, 0x85, 0xD2, 0x74, 0x3F);             // test r10, r10; jz search
+        c.Raw(0x8B, 0x01, 0x41, 0x89, 0x02);             // record exception code
+        c.Raw(0x48, 0x8B, 0x41, 0x10, 0x49, 0x89, 0x42, 0x08); // record exception address
+        c.Raw(0x49, 0x8B, 0x41, 0x28, 0x48, 0x89, 0x44, 0x24, 0x20); // context = DispatcherContext.ContextRecord
+        c.Raw(0x49, 0x8B, 0x41, 0x40, 0x48, 0x89, 0x44, 0x24, 0x28); // history = DispatcherContext.HistoryTable
+        c.Raw(0x49, 0x89, 0xC8, 0x48, 0x89, 0xD1);       // r8 = exception record; rcx = establisher frame
+        c.Raw(0x48, 0xBA);
+        c.U64(landingAddress);                           // rdx = launcher epilogue
+        c.Raw(0x45, 0x31, 0xC9, 0x48, 0xB8);             // r9 = return value (0)
+        c.U64(unwindAddress);
+        c.Raw(0xFF, 0xD0, 0xCC);                         // RtlUnwindEx does not return here
+        c.Raw(0xB8, 1, 0, 0, 0, 0x48, 0x83, 0xC4, 0x38, 0xC3); // ExceptionContinueSearch
         return c.ToArray();
     }
 
@@ -144,7 +185,7 @@ public static class X64StubEmitter
         c.Raw(0x5B);                                     // pop rbx
     }
 
-    private static void EmitSaveXmm(CodeWriter c)
+    private static void EmitSaveXmm(CodeWriter c, List<byte> offsets)
     {
         for (var register = 6; register <= 15; register++)
         {
@@ -152,6 +193,7 @@ public static class X64StubEmitter
             if (register >= 8) c.Raw(0x44);              // REX.R
             c.Raw(0x0F, 0x11, (byte)(0x84 | ((register & 7) << 3)), 0x24); // movups [rsp+disp32], xmmN
             c.I32(offset);
+            offsets.Add((byte)c.Length);
         }
     }
 

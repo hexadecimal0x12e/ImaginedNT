@@ -59,6 +59,7 @@ public static class BuiltinApis
             o.MaximumVirtualMemoryBytes,
             o.JobActiveProcessLimit,
             o.AllowNativeForwarding,
+            o.AllowUnimplementedApiForwarding,
             o.AllowFileWrites,
             o.AllowProcessCreation,
             o.IsPackaged,

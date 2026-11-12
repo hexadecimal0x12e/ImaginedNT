@@ -19,15 +19,13 @@ public enum ImportPolicy
     /// <summary>优先使用托管实现，缺失时尝试转发到本机 DLL。</summary>
     ManagedFirst,
     /// <summary>仅使用托管实现，不尝试本机转发。</summary>
-    ManagedOnly,
-    /// <summary>优先使用本机导出，缺失时回退到托管实现；DLL 加载、符号查询和 Partially Imagined 实现仍由运行时处理。</summary>
-    NativeFirst
+    ManagedOnly
 }
 
 /// <summary>本机转发是否只允许声明表中的导出。</summary>
 public enum NativeApiPolicy
 {
-    /// <summary>允许转发任何可解析的本机导出，保留原有行为。</summary>
+    /// <summary>允许为未实现 API 使用本机保底转发。</summary>
     AllowAll,
     /// <summary>只允许转发通过 <see cref="PartiallyImaginedNativeApiAttribute"/> 声明的本机导出。</summary>
     DeclaredOnly
@@ -38,7 +36,7 @@ public enum NativeApiPolicy
 /// </summary>
 public sealed class ProcessCreateOptions
 {
-    /// <summary>来宾可执行映像的宿主文件路径，通常由父进程的沙箱解析得到。</summary>
+    /// <summary>来宾映像的宿主文件路径；托管 Imagined Process 仅用作进程标识，无需实际文件。</summary>
     public required string ImagePath { get; init; }
 
     /// <summary>来宾命令行；未指定时使用加双引号的映像完整路径。</summary>
@@ -53,6 +51,12 @@ public sealed class ProcessCreateOptions
     /// <summary>同一运行时内父来宾进程的 ID；未指定时不关联父进程。</summary>
     public int? ParentId { get; init; }
 
+    /// <summary>目标会话；未指定时继承父进程会话，否则使用运行时默认会话。</summary>
+    public uint? SessionId { get; init; }
+
+    /// <summary>启动桌面：Desktop 或 WindowStation\Desktop；未指定时继承父进程。</summary>
+    public string? Desktop { get; init; }
+
     /// <summary>是否作为根进程；未指定时，仅在运行时尚无来宾进程的情况下作为根进程。</summary>
     public bool? IsRoot { get; init; }
 
@@ -63,6 +67,9 @@ public sealed class ProcessCreateOptions
 /// <summary>ImaginedNT 运行时及其来宾进程的配置。</summary>
 public sealed class RuntimeOptions
 {
+    /// <summary>无父进程时的默认会话，在运行时启动时创建。</summary>
+    public uint DefaultSessionId { get; set; }
+
     /// <summary>是否为来宾模拟 MSIX 包身份，默认无包身份。</summary>
     public bool IsPackaged { get; set; }
 
@@ -95,7 +102,7 @@ public sealed class RuntimeOptions
     /// <summary>是否向诊断输出目标写入跟踪日志，默认为 false。</summary>
     public bool TraceToConsole { get; set; }
 
-    /// <summary>是否执行来宾映像，默认为 true；当前运行路径尚未使用此开关。</summary>
+    /// <summary>是否在会话启动时自动创建并执行来宾映像，默认为 true；false 时仅初始化环境，由持有方显式创建和启动进程。</summary>
     public bool ExecuteImage { get; set; } = true;
 
     /// <summary>是否修补已加载映像中的直接系统调用指令以进行拦截，默认为 false。</summary>
@@ -141,10 +148,13 @@ public sealed class RuntimeOptions
     /// <summary>是否允许将 API 调用转发到宿主本机 DLL，默认为 true，仍受导入解析策略约束。</summary>
     public bool AllowNativeForwarding { get; set; } = true;
 
+    /// <summary>是否为未实现且未声明的 API 启用本机保底转发，默认为 true；仍受本机转发声明策略约束。</summary>
+    public bool AllowUnimplementedApiForwarding { get; set; } = true;
+
     /// <summary>
     /// 本机转发的声明策略，默认为 <see cref="NativeApiPolicy.AllowAll"/>。
-    /// 设为 <see cref="NativeApiPolicy.DeclaredOnly"/> 时，只有通过
-    /// <see cref="PartiallyImaginedNativeApiAttribute"/> 声明的模块/导出才允许转发；序数导入没有名称，默认拒绝。
+    /// 未声明导出还需启用 <see cref="AllowUnimplementedApiForwarding"/>；设为
+    /// <see cref="NativeApiPolicy.DeclaredOnly"/> 时，仅允许转发已声明的模块/导出。
     /// </summary>
     public NativeApiPolicy NativeApiPolicy { get; set; } = NativeApiPolicy.AllowAll;
 
@@ -187,7 +197,7 @@ public sealed class RuntimeOptions
     /// System32 版本，而不是沙盒中的同名 DLL。用于运行 ReactOS 等自带系统 DLL 的 PE，
     /// 避免执行未初始化的来宾 ntdll/kernel32；沙盒中不存在的 DLL 仍会回退到沙盒。
     /// </summary>
-    public bool PreferHostSystemDlls { get; set; }
+    public bool PreferHostSystemDlls { get; set; } = true;
 
     /// <summary>是否在 API 调用日志中记录参数，默认为 true。</summary>
     public bool TraceApiArguments { get; set; } = true;
