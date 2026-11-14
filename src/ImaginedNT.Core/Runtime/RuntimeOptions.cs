@@ -36,6 +36,11 @@ public enum NativeApiPolicy
 /// </summary>
 public sealed class ProcessCreateOptions
 {
+    /// <summary>
+    /// Gets the access token.
+    /// </summary>
+    public Security.AccessToken? Token { get; init; }
+
     /// <summary>来宾映像的宿主文件路径；托管 Imagined Process 仅用作进程标识，无需实际文件。</summary>
     public required string ImagePath { get; init; }
 

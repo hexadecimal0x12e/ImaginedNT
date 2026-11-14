@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using ImaginedNT.AppShared.Gui;
 using ImaginedNT.Core.Diagnostics;
 using ImaginedNT.Core.Runtime;
 

@@ -141,6 +141,8 @@ internal static unsafe class NativeHandleBridge
                 ? (uint)ctx.Thread.InvokeGuest(target, new ReadOnlySpan<ulong>(args, 16))
                 : call(args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
                     args[8], args[9], args[10], args[11], args[12], args[13], args[14], args[15]);
+            if (ctx.Thread.TerminationRequested && !ctx.Thread.IsImaginedEntry)
+                throw new GuestThreadExitException(ctx.Thread.TerminationExitCode);
             if (!nt) lastError = NativeMethods.GetLastError();
             if (name == "NtDuplicateObject" && (ctx.Arg(6) & 1) != 0 && ctx.Handles.TryGet(ctx.Arg(1), out _))
                 ctx.Handles.Close(ctx.Arg(1));

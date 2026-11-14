@@ -12,6 +12,7 @@ public sealed class ImaginedProcessContext
     public ImaginedThread Thread { get; }
     public ImaginedProcess Process => Thread.Process;
     public ImaginedRuntime Runtime => Process.Runtime;
+    public Security.AccessToken Token => Thread.EffectiveToken;
     public VirtualMemoryManager Memory => Process.Memory;
     public GuestHeap Heap => Process.Heap;
     public HandleTable Handles => Process.Handles;

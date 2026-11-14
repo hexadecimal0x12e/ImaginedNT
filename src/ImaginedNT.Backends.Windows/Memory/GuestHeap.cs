@@ -4,7 +4,8 @@ using ImaginedNT.Core.Native;
 
 namespace ImaginedNT.Core.Memory;
 
-public sealed class GuestHeap(TraceLog trace, int processId, uint options = 0, ulong initialSize = 0, ulong maximumSize = 0, RuntimeMemory? memory = null) : IDisposable
+public sealed class GuestHeap(TraceLog trace, int processId, uint options = 0, ulong initialSize = 0, ulong maximumSize = 0,
+    RuntimeMemory? memory = null, ulong reserveSize = 0) : IDisposable
 {
     private readonly RuntimeMemory _memory = memory ?? new RuntimeMemory();
     private const uint ZeroMemory = 0x8, InPlaceOnly = 0x10;
@@ -14,10 +15,12 @@ public sealed class GuestHeap(TraceLog trace, int processId, uint options = 0, u
     private IntPtr _handle;
     private bool _disposed;
 
+    public uint Options => options;
+
     private ulong CommittedSize(ulong allocated) => VirtualMemoryManager.PageAlign(
         Math.Max(VirtualMemoryManager.PageSize, Math.Max(initialSize, allocated)));
 
-    private ulong ReservedSize(ulong committed) => VirtualMemoryManager.GranularityAlign(Math.Max(maximumSize, committed));
+    private ulong ReservedSize(ulong committed) => VirtualMemoryManager.GranularityAlign(Math.Max(reserveSize, Math.Max(maximumSize, committed)));
 
     private bool CanResize(ulong allocated)
     {
@@ -46,12 +49,20 @@ public sealed class GuestHeap(TraceLog trace, int processId, uint options = 0, u
             if (_handle == IntPtr.Zero)
             {
                 if (initialSize > ulong.MaxValue - VirtualMemoryManager.AllocationGranularity ||
-                    maximumSize > ulong.MaxValue - VirtualMemoryManager.AllocationGranularity || !CanResize(0)) return 0;
+                    maximumSize > ulong.MaxValue - VirtualMemoryManager.AllocationGranularity ||
+                    reserveSize > ulong.MaxValue - VirtualMemoryManager.AllocationGranularity || !CanResize(0)) return 0;
                 _memory.RegisterProcess(processId);
-                _handle = NativeMethods.HeapCreate(options, (UIntPtr)initialSize, (UIntPtr)maximumSize);
+                _handle = NativeMethods.HeapCreate(options & ~4u, (UIntPtr)initialSize, (UIntPtr)maximumSize);
                 if (_handle == IntPtr.Zero)
                 {
                     trace.Warn($"could not create guest heap: Win32 error {Marshal.GetLastWin32Error()}", processId, threadId);
+                    return 0;
+                }
+                try { _memory.RegisterGuestHeap((ulong)(nuint)_handle, this); }
+                catch (OutOfMemoryException)
+                {
+                    NativeMethods.HeapDestroy(_handle);
+                    _handle = IntPtr.Zero;
                     return 0;
                 }
                 SetUsage(0);
@@ -70,6 +81,13 @@ public sealed class GuestHeap(TraceLog trace, int processId, uint options = 0, u
     {
         lock (_memory.Gate)
         lock (_gate) return !_disposed && _blocks.ContainsKey(address);
+    }
+
+    public bool ContainsAddress(ulong address)
+    {
+        lock (_memory.Gate)
+        lock (_gate) return !_disposed && (_blocks.ContainsKey(address) ||
+            _blocks.Any(b => address >= b.Key && address - b.Key < b.Value));
     }
 
     public ulong Allocate(ulong size, bool zero = false, int threadId = 0)
@@ -184,6 +202,7 @@ public sealed class GuestHeap(TraceLog trace, int processId, uint options = 0, u
                 trace.Warn("could not destroy guest heap", processId);
                 return false;
             }
+            _memory.ForgetGuestHeap((ulong)(nuint)_handle);
             _handle = IntPtr.Zero;
             _blocks.Clear();
             if (_committedBytes != 0 || _reservedBytes != 0)

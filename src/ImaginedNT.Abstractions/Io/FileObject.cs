@@ -17,6 +17,7 @@ public abstract class FileObject : NtObject
     public bool IsDirectory { get; init; }
     public virtual bool CanRead => true;
     public virtual bool CanWrite => true;
+    public virtual bool CanSeek => false;
     public virtual bool InputAvailable => false;
     public virtual bool DeleteOnClose { get; set; }
 

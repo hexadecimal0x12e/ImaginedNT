@@ -52,6 +52,7 @@ public static partial class CrtHeapApis
             if (blocks.TryGetValue(ctx.Arg(0), out var block) && block.Alignment == ctx.Arg(1) && block.Offset == ctx.Arg(2))
                 return block.Size;
             ctx.Runtime.Trace.Warn($"{ctx.Name}: invalid aligned block or alignment/offset at 0x{ctx.Arg(0):X}", ctx.Process.Id, ctx.Thread.Id);
+            CrtLocaleData.SetErrno(22);
             return ulong.MaxValue;
         }
     }
@@ -61,12 +62,14 @@ public static partial class CrtHeapApis
         if (alignment == 0 || (alignment & (alignment - 1)) != 0 || (offset != 0 && offset >= size))
         {
             ctx.Runtime.Trace.Warn($"{ctx.Name}: invalid alignment {alignment} or offset {offset} for size {size}", ctx.Process.Id, ctx.Thread.Id);
+            CrtLocaleData.SetErrno(22);
             return 0;
         }
         var mask = Math.Max(alignment, 8UL) - 1;
-        if (Math.Max(size, 1UL) > MaxSize - mask - 8)
+        if (mask > MaxSize - 8 || Math.Max(size, 1UL) > MaxSize - mask - 8)
         {
             ctx.Runtime.Trace.Warn($"{ctx.Name}: aligned allocation size overflow", ctx.Process.Id, ctx.Thread.Id);
+            CrtLocaleData.SetErrno(12);
             return 0;
         }
         var blocks = AlignedBlocks.GetValue(ctx.Process, static _ => new());
@@ -84,6 +87,7 @@ public static partial class CrtHeapApis
             {
                 ctx.Process.Heap.Free(address, ctx.Thread.Id);
                 ctx.Runtime.Trace.Warn($"{ctx.Name}: cannot track aligned allocation: {ex.Message}", ctx.Process.Id, ctx.Thread.Id);
+                CrtLocaleData.SetErrno(12);
                 return 0;
             }
             return result;
@@ -99,6 +103,7 @@ public static partial class CrtHeapApis
             if (!blocks.TryGetValue(address, out var block))
             {
                 ctx.Runtime.Trace.Warn($"{ctx.Name}: unknown aligned block at 0x{address:X}", ctx.Process.Id, ctx.Thread.Id);
+                CrtLocaleData.SetErrno(22);
                 return false;
             }
             if (!ctx.Process.Heap.Free(block.Base, ctx.Thread.Id)) return false;
@@ -118,9 +123,10 @@ public static partial class CrtHeapApis
         lock (blocks)
         {
             blocks.TryGetValue(address, out var previous);
-            if (address != 0 && (previous is null || previous.Alignment != alignment))
+            if (address != 0 && (previous is null || previous.Alignment != alignment || previous.Offset != offset))
             {
                 ctx.Runtime.Trace.Warn($"{ctx.Name}: unknown aligned block or changed alignment at 0x{address:X}", ctx.Process.Id, ctx.Thread.Id);
+                CrtLocaleData.SetErrno(22);
                 return 0;
             }
             var result = AllocateAligned(ctx, size, alignment, offset);

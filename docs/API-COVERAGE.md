@@ -7,6 +7,12 @@ At the time of writing the registry contains **475 managed entry points** (alias
 **346 native declarations**. The numbers grow as APIs are added; always use `apis` for the exact
 list.
 
+The managed security surface includes runtime-local user/group management (`NetUserAdd/Del/SetInfo`,
+`NetLocalGroupAdd/AddMembers/DelMembers`), password logon, process/thread token opens, token duplication,
+selected token information, `AdjustTokenPrivileges`, membership checks, impersonation and `CreateProcessAsUserA/W`.
+Filesystem rules can select a user, group or SID; object ACLs and handle masks control resource access.
+See [users and permissions](SECURITY.md) for supported information levels and token classes.
+
 ## Memory
 
 | API | Notes |
@@ -15,11 +21,17 @@ list.
 | `NtFreeVirtualMemory` | decommit/release |
 | `NtProtectVirtualMemory` | writes back old protection and rounded size |
 | `NtQueryVirtualMemory` | `MemoryBasicInformation` (class 0), mapped-file-name shape (class 2) |
-| `NtLockVirtualMemory` / `NtUnlockVirtualMemory` | success no-ops (pages are already committed) |
-| `VirtualAlloc` / `VirtualFree` / `VirtualProtect` / `VirtualQuery` | Win32 wrappers with `GetLastError` |
-| `VirtualLock` / `VirtualUnlock` / `GetLargePageMinimum` | no-op / constant |
+| `NtLockVirtualMemory` / `NtUnlockVirtualMemory` | host-backed page locking, rounded base/size; NT memory entries also expose Zw aliases |
+| `VirtualAlloc` / `VirtualFree` / `VirtualProtect` / `VirtualQuery` | Win32 wrappers with `GetLastError`; Ex and NT entries resolve guest process handles and check access masks |
+| `ReadProcessMemory` / `WriteProcessMemory`, `NtReadVirtualMemory` / `NtWriteVirtualMemory` | guest process handles, VM access checks, native transfer status and transferred byte counts |
+| `VirtualLock` / `VirtualUnlock` / `GetLargePageMinimum` | host-backed locking and large-page minimum query |
+| `HeapCreate` / `HeapDestroy`, `HeapAlloc` / `HeapReAlloc` / `HeapFree` / `HeapSize` | guest heap ownership, shared admission budgets, allocator mismatch checks; Rtl allocation/free/size aliases |
+| `GetProcessHeaps`, `HeapValidate` / `RtlValidateHeap`, `HeapCompact` / `RtlCompactHeap`, `HeapWalk` | guest heap enumeration and validated native heap operations |
+| `RtlCreateHeap` / `RtlDestroyHeap` | growable runtime-owned heaps; caller-provided heap storage, locks and parameter blocks are unsupported |
+| `LocalAlloc` / `GlobalAlloc`, `LocalReAlloc` / `GlobalReAlloc`, `LocalFree` / `GlobalFree` | native fixed/movable handle semantics and accounting; compatibility buffers from the guest default heap stay with that heap |
+| `LocalSize` / `GlobalSize`, `LocalLock` / `GlobalLock`, `LocalUnlock` / `GlobalUnlock`, `LocalHandle` / `GlobalHandle`, `LocalFlags` / `GlobalFlags` | paired handle operations; fixed guest buffers avoid host default-heap lookups |
 | `RtlZeroMemory` / `RtlFillMemory` / `RtlCopyMemory` / `RtlMoveMemory` / `RtlCompareMemory` | chunked, bounds-safe |
-| `memcpy` | alias for `RtlCopyMemory` |
+| `ntdll!memcpy` / `memmove` / `memset`, `RtlSecureZeroMemory` | full SIZE_T lengths, chunked access, correct pointer returns; backward copies check source reads |
 | `GlobalMemoryStatus` / `GlobalMemoryStatusEx`, `GetPhysicallyInstalledSystemMemory` | isolated runtime capacity and availability; shared guest commit/reservation budgets |
 | `GetProcessMemoryInfo` / `K32GetProcessMemoryInfo`, `NtQueryInformationProcess` / `ZwQueryInformationProcess` | selected guest's allocation usage and peaks; `ProcessVmCounters` only for the NT query |
 | `GetPerformanceInfo` / `K32GetPerformanceInfo` | environment-wide memory accounting in pages and guest handle/process/thread counts |
@@ -182,11 +194,11 @@ API assembly is registered.
 | `CoCreateInstance`, `CoCreateInstanceEx` | managed classes, guest factories, registered servers, then host fallback; `CoCreateInstanceEx` accepts local `MULTI_QI` arrays |
 | `CoGetClassObject` | managed/partial class factory, guest factory `QueryInterface`, server `DllGetClassObject`, or host fallback; supports `IID_IClassFactory` and `IID_IUnknown` |
 | `CoRegisterClassObject`, `CoRevokeClassObject` | guest `IClassFactory` pointers, held with `AddRef`/`Release` |
-| `CoTaskMemAlloc`, `CoTaskMemFree`, `CoTaskMemRealloc` | host COM task allocator |
+| `CoTaskMemAlloc`, `CoTaskMemFree`, `CoTaskMemRealloc` | host COM task allocator, SIZE_T lengths, zero-size allocations and accounting; failures preserve the old block |
 | `CoCreateGuid`, `StringFromCLSID`, `StringFromIID`, `CLSIDFromString`, `IIDFromString` | GUID conversion; returned strings are task-allocated |
 | `CoLoadLibrary`, `CoFreeLibrary`, `CoFreeUnusedLibraries` | guest or host in-process server DLLs; invokes `DllGetClassObject`/`DllCanUnloadNow` where present |
 | `CoGetCurrentProcess`, `CoGetCurrentLogicalThreadId` | virtual process/thread identity |
-| `SysAllocString`, `SysAllocStringLen`, `SysFreeString`, `SysStringLen`, `SysStringByteLen` | BSTRs; also registered by ordinal `#2`, `#4`, `#6`, `#7` |
+| `SysAllocString` / `SysAllocStringLen` / `SysAllocStringByteLen`, `SysReAllocString` / `SysReAllocStringLen`, `SysFreeString`, `SysStringLen` / `SysStringByteLen` | native BSTR allocator, null/empty and byte-length semantics, accounting; classic ordinals `#2`–`#7` |
 
 Fully managed classes are registered by CLSID and implement their interface methods as
 `ulong Method(ComCallContext)`. The runtime allocates one guest-readable interface block per
@@ -208,11 +220,11 @@ registry, `CoGetMalloc`, `RoInitialize`/WinRT, and `COSERVERINFO` targets in `Co
 Guest server DLLs remain mapped for the process lifetime even after `CoFreeLibrary`; host server
 DLLs are released when `DllCanUnloadNow` returns `S_OK`.
 
-## Window manager and DWM (`ImaginedNT.App`)
+## Window manager and DWM (`ImaginedNT.AppShared`)
 
-These registrations live in the UWP App project (`src/ImaginedNT.App/Gui`), not in
+These registrations live in the shared class library (`src/ImaginedNT.AppShared/Gui`), not in
 `ImaginedNT.Apis`: the window personality is an App-layer interface that needs a host compositor.
-`GuiSession` creates a runtime whose API set is `BuiltinApis.Assemblies` plus the App assembly,
+`GuiSession` creates a runtime whose API set is `BuiltinApis.Assemblies` plus the AppShared assembly,
 and attaches a `WindowManager` that `Controls/DwmCompositor.xaml` renders.
 
 | API | Notes |

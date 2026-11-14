@@ -9,7 +9,7 @@ internal static class VirtualEnvironment
     internal static string Expand(string value, IReadOnlyDictionary<string, string> variables) =>
         Regex.Replace(value, "%([^%]+)%", m => variables.TryGetValue(m.Groups[1].Value, out var v) ? v : m.Value);
 
-    internal static IReadOnlyDictionary<string, string> Create(ImaginedRuntime runtime, string root)
+    internal static IReadOnlyDictionary<string, string> Create(ImaginedRuntime runtime, string root, string? userSid = null)
     {
         var variables = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -46,7 +46,7 @@ internal static class VirtualEnvironment
             {
                 foreach (var target in new[] { EnvironmentVariableTarget.Machine, EnvironmentVariableTarget.User })
                 {
-                    var values = store.ReadEnvironment(target);
+                    var values = store.ReadEnvironment(target, userSid);
                     foreach (var (name, value) in values.Where(p => !p.Value.Expand)) Apply(name, value.Value, target);
                     // Expand against the completed REG_SZ layer, before applying expanded values.
                     foreach (var (name, value) in values.Where(p => p.Value.Expand)

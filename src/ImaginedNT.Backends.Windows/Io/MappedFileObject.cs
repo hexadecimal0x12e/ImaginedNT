@@ -16,6 +16,7 @@ public sealed class MappedFileObject : FileObject
     public override long Length => _read?.Length ?? _write?.Length ?? 0;
     public override bool CanRead => _read is not null;
     public override bool CanWrite => _write is not null || _discard;
+    public override bool CanSeek => true;
     public override int Read(Span<byte> buffer)
     {
         if (_read is null) throw new NtFileException(NtStatus.AccessDenied, "handle is not readable");

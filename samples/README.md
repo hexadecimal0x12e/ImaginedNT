@@ -67,7 +67,7 @@ dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin
 "dir`nrun hello.exe`nexit" | dotnet src/ImaginedNT.Host/bin/Debug/net10.0/ImaginedNT.Host.dll run samples/bin/shell.exe --strict --sandbox sandbox\shell
 ```
 
-`window.exe` needs the App's USER32/DWM implementation, which lives in `src/ImaginedNT.App/Gui`
+`window.exe` needs the App's USER32/DWM implementation, which lives in `src/ImaginedNT.AppShared/Gui`
 (not in the Host API set).  Build it, then run it from the App's `窗口桌面` page; running it
 through `ImaginedNT.Host` will still create the window state but there is no compositor to show it.
 

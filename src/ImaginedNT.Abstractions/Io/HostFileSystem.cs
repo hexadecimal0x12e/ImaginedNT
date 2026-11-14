@@ -91,28 +91,11 @@ public static class HostFileSystem
         try
         {
             if (GetGrantedAccess(path) is { } granted) return granted.TryGetInfo(path)?.IsDirectory == directory;
-            try
-            {
-                //Debug.WriteLine($"Finding {path} {directory}");
-                if (directory ? Directory.Exists(path) : File.Exists(path))
-                {
-                    //Debug.WriteLine($"found {path}");
-                    return true;
-                }
-            }
-            catch { }
-            if(GetInfo(path).IsDirectory == directory)
-            {
-                //Debug.WriteLine($"found {path}");
-                return true;
-            }
-            else
-            {
-                Debug.WriteLine($"not found {path}");
-                return false;
-            }
+            if (directory ? Directory.Exists(path) : File.Exists(path)) return true;
+            return GetFileAttributesExFromAppW(Path.GetFullPath(path), 0, out var data) &&
+                ((data.Attributes & FileAttributes.Directory) != 0) == directory;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { Debug.WriteLine($"not found {path}"); return false; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { return false; }
     }
 
     public static HostFileInfo GetInfo(string path)

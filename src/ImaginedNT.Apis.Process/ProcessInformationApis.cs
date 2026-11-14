@@ -28,6 +28,7 @@ public static class ProcessInformationApis
             ctx.SetLastError(Win32Error.InvalidParameter);
             return 0;
         }
+        if (!CanOpenProcess(ctx, process)) return BoolResult(ctx, false, Win32Error.AccessDenied);
         using var obj = new ProcessObject(process);
         return ctx.Handles.Create(obj, ctx.Arg32(0), inheritable: ctx.ArgBool(1));
     }
@@ -47,10 +48,17 @@ public static class ProcessInformationApis
         }
         var process = id <= int.MaxValue ? ctx.Runtime.GetProcessById((int)id) : null;
         if (process is null || process.IsTerminating) return NtStatus.InvalidCid;
+        if (!CanOpenProcess(ctx, process)) return NtStatus.AccessDenied;
         using var obj = new ProcessObject(process);
         ctx.Write(ctx.Arg(0), ctx.Handles.Create(obj, ctx.Arg32(1),
             inheritable: ctx.Arg(2) != 0 && (ctx.Read<uint>(ctx.Arg(2) + 24) & 2) != 0));
         return NtStatus.Success;
+    }
+
+    private static bool CanOpenProcess(ApiCallContext ctx, ImaginedProcess process)
+    {
+        var token = ctx.Thread.EffectiveToken;
+        return token.IsSystem || token.User.Sid == process.Token.User.Sid || token.HasPrivilege("SeDebugPrivilege");
     }
 
     [VirtualApi("kernel32.dll", "QueryFullProcessImageNameW", ApiCategory.Process, "kernelbase!QueryFullProcessImageNameW")]

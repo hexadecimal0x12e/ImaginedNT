@@ -131,6 +131,10 @@ internal static unsafe class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool TerminateThread(IntPtr hThread, uint dwExitCode);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool CancelSynchronousIo(IntPtr hThread);
+
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern IntPtr LoadLibraryW(string lpFileName);
 

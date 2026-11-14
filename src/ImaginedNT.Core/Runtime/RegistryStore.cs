@@ -15,19 +15,19 @@ internal sealed class RegistryStore
             .GetOrAdd(Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)),
                 path => new Lazy<RegistryStore>(() => new(path))).Value;
 
-    private RegistryKeyData? EnvironmentKey(EnvironmentVariableTarget target) => target switch
+    private RegistryKeyData? EnvironmentKey(EnvironmentVariableTarget target, string? userSid) => target switch
     {
-        EnvironmentVariableTarget.User => Find(Root(0x80000001), "Environment"),
+        EnvironmentVariableTarget.User => Find(Root(0x80000001, userSid), "Environment"),
         EnvironmentVariableTarget.Machine => Find(Root(0x80000002), @"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
         _ => throw new ArgumentOutOfRangeException(nameof(target))
     };
 
-    internal Dictionary<string, (string Value, bool Expand)> ReadEnvironment(EnvironmentVariableTarget target)
+    internal Dictionary<string, (string Value, bool Expand)> ReadEnvironment(EnvironmentVariableTarget target, string? userSid = null)
     {
         lock (Gate)
         {
             var values = new Dictionary<string, (string, bool)>(StringComparer.OrdinalIgnoreCase);
-            if (EnvironmentKey(target) is not { } key) return values;
+            if (EnvironmentKey(target, userSid) is not { } key) return values;
             foreach (var (name, value) in key.Values)
                 if (name.Length > 0 && !name.Contains('=') && value.Type is 1 or 2 && (value.Data.Length & 1) == 0)
                     values[name] = (Encoding.Unicode.GetString(value.Data).Split('\0')[0], value.Type == 2);
@@ -35,18 +35,18 @@ internal sealed class RegistryStore
         }
     }
 
-    internal void SetEnvironment(string name, string? value, EnvironmentVariableTarget target)
+    internal void SetEnvironment(string name, string? value, EnvironmentVariableTarget target, string? userSid = null)
     {
         lock (Gate)
         {
-            var key = EnvironmentKey(target);
+            var key = EnvironmentKey(target, userSid);
             if (value is null)
             {
                 if (key is not null && key.Values.ContainsKey(name)) DeleteValue(key, name);
                 return;
             }
             key ??= target == EnvironmentVariableTarget.User
-                ? Create(Root(0x80000001), "Environment", "", out _)
+                ? Create(Root(0x80000001, userSid), "Environment", "", out _)
                 : Create(Root(0x80000002), @"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "", out _);
             SetValue(key, name, value.Contains('%') ? 2u : 1u, Encoding.Unicode.GetBytes(value + '\0'));
         }
@@ -92,6 +92,17 @@ internal sealed class RegistryStore
     internal object Gate { get; } = new();
     internal string FilePath { get; }
     internal RegistryKeyData Root(uint handle) => _document.Roots[RootNames[handle]];
+
+    internal RegistryKeyData Root(uint handle, string? userSid)
+    {
+        if (handle != 0x80000001 || userSid is null) return Root(handle);
+        lock (Gate)
+        {
+            var users = Root(0x80000003);
+            if (!users.SubKeys.TryGetValue(userSid, out var key)) users.SubKeys.Add(userSid, key = new());
+            return key;
+        }
+    }
 
     private static void Restore(RegistryKeyData key)
     {

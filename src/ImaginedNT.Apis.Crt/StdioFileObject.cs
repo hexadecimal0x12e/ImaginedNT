@@ -13,6 +13,7 @@ internal sealed class StdioFileObject(SafeFileHandle handle, int flags, string? 
     private int Access => flags & 3;
     public override bool CanRead => Access == 2 || (Access == 0 && (flags & 0x8) == 0);
     public override bool CanWrite => Access is 1 or 2 || (flags & 0x8) != 0;
+    public override bool CanSeek => GetFileType(handle) is not (2 or 3);
     public override nint GetNativeHandle() => handle.DangerousGetHandle();
     public override long Position { get => Seek(0, SeekOrigin.Current); set => Seek(value, SeekOrigin.Begin); }
     public override long Length => GetFileSizeEx(handle, out var length) ? length : throw Failure();
@@ -22,7 +23,7 @@ internal sealed class StdioFileObject(SafeFileHandle handle, int flags, string? 
         // Anonymous pipes and character devices have no file position.  Windows fails these
         // seeks; succeeding would make consumers (cmd.exe in particular) treat redirected
         // stdin as a seekable disk file.
-        if (GetFileType(handle) is 2 or 3) throw new NotSupportedException("CRT handle is not seekable");
+        if (!CanSeek) throw new NotSupportedException("CRT handle is not seekable");
         return SetFilePointerEx(handle, offset, out var position, (uint)origin) ? position : throw Failure();
     }
 

@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 
-namespace ImaginedNT.App.Gui;
+namespace ImaginedNT.AppShared.Gui;
 
 /// <summary>
 /// Win32 USER32 constants and small guest-memory layouts used by the App-side window manager.
@@ -225,9 +225,19 @@ internal static class Win32
     public const int MK_SHIFT = 0x0004;
     public const int MK_CONTROL = 0x0008;
     public const int MK_MBUTTON = 0x0010;
+    public const int VK_BACK = 0x08;
+    public const int VK_TAB = 0x09;
+    public const int VK_RETURN = 0x0D;
     public const int VK_SHIFT = 0x10;
     public const int VK_CONTROL = 0x11;
     public const int VK_MENU = 0x12;
+    public const int VK_ESCAPE = 0x1B;
+    public const int VK_PRIOR = 0x21;
+    public const int VK_DOWN = 0x28;
+    public const int VK_INSERT = 0x2D;
+    public const int VK_DELETE = 0x2E;
+    public const int VK_F1 = 0x70;
+    public const int VK_F24 = 0x87;
     public const int VK_LSHIFT = 0xA0;
     public const int VK_RSHIFT = 0xA1;
     public const int VK_LCONTROL = 0xA2;

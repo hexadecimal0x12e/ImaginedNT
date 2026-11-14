@@ -1,7 +1,7 @@
 using ImaginedNT.Core.Diagnostics;
 using ImaginedNT.Core.Runtime;
 
-namespace ImaginedNT.App.Gui;
+namespace ImaginedNT.AppShared.Gui;
 
 /// <summary>
 /// The App-side window manager and the simplest possible DWM model.  It owns window classes,
@@ -14,10 +14,8 @@ public sealed class WindowManager : IDisposable
     public IWindowDrawing? Drawing { get; set; }
     private static readonly string[] BuiltInClasses = ["STATIC", "BUTTON", "EDIT", "COMBOBOX", "LISTBOX", "SCROLLBAR"];
 
-    // ARGB values are converted to COLORREF for GetSysColor.
-    private static readonly uint[] SystemColorsArgb =
+    private static readonly uint[] LightColorsArgb =
     [
-#if FULL_TRUST_APP
         0xFFC8C8C8, // COLOR_SCROLLBAR
         0xFFE8EBEF, // COLOR_BACKGROUND / DESKTOP
         0xFFF3F3F3, // COLOR_ACTIVECAPTION
@@ -49,7 +47,10 @@ public sealed class WindowManager : IDisposable
         0xFFF3F3F3, // COLOR_GRADIENTINACTIVECAPTION
         0xFF0078D7, // COLOR_MENUHILIGHT
         0xFFF0F0F0  // COLOR_MENUBAR
-#else
+    ];
+
+    private static readonly uint[] DarkColorsArgb =
+    [
         0xFF2A2E35, // COLOR_SCROLLBAR
         0xFF101318, // COLOR_BACKGROUND / DESKTOP
         0xFF1F6FEB, // COLOR_ACTIVECAPTION
@@ -81,9 +82,10 @@ public sealed class WindowManager : IDisposable
         0xFF30363D, // COLOR_GRADIENTINACTIVECAPTION
         0xFF1F6FEB, // COLOR_MENUHILIGHT
         0xFF20242B  // COLOR_MENUBAR
-#endif
     ];
 
+    private readonly uint[] _systemColorsArgb;
+    private readonly bool _respectWindowBorderStyle;
     private readonly ImaginedRuntime _runtime;
     private readonly object _gate = new();
     private readonly Dictionary<ulong, GuestWindow> _windows = new();
@@ -196,9 +198,11 @@ public sealed class WindowManager : IDisposable
         public void Dispose() => Timer.Dispose();
     }
 
-    public WindowManager(ImaginedRuntime runtime)
+    public WindowManager(ImaginedRuntime runtime, bool useLightTheme = false, bool respectWindowBorderStyle = false)
     {
         _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
+        _systemColorsArgb = useLightTheme ? LightColorsArgb : DarkColorsArgb;
+        _respectWindowBorderStyle = respectWindowBorderStyle;
         _runtime.ProcessExited += CleanupProcess;
         _runtime.ThreadExited += CleanupThread;
     }
@@ -916,7 +920,7 @@ public sealed class WindowManager : IDisposable
             Math.Max(0, window.Width), Math.Max(0, window.Height));
     }
 
-    private GuiRect ClientLocked(GuestWindow window) => WindowGeometry.Client(window, OuterLocked(window));
+    private GuiRect ClientLocked(GuestWindow window) => WindowGeometry.Client(window, OuterLocked(window), _respectWindowBorderStyle);
 
     // --- snapshot and hit testing ----------------------------------------------
 
@@ -1554,8 +1558,8 @@ public sealed class WindowManager : IDisposable
 
     public uint SystemColorArgb(int index)
     {
-        if (index < 0 || index >= SystemColorsArgb.Length) index = Win32.COLOR_WINDOW;
-        return SystemColorsArgb[index];
+        if (index < 0 || index >= _systemColorsArgb.Length) index = Win32.COLOR_WINDOW;
+        return _systemColorsArgb[index];
     }
 
     public uint GetSysColorRef(int index)

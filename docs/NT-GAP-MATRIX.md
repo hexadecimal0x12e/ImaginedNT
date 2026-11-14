@@ -37,11 +37,11 @@
 | Process/thread manager (Ps) | Managed `CreateProcessW/A`, `CreateThread`, waits, exit, TLS/FLS | `NtCreateUserProcess`, `NtCreateProcess/Thread`, most query/set information classes, tokens, jobs, APC, fibers, priorities/affinity, PEB/TEB, Wow64, mitigation | P0/P1 |
 | Synchronization (Ke) | Event/Mutant/Semaphore, basic waits, critical sections | Waitable timers, keyed events, IO completion, APC/alertable waits, wait abandonment, SRW/condition variables, wait chains | P1 |
 | Registry (Cm) | Win32 `Reg*` over a JSON-backed virtual store | Native `Nt*` registry APIs, key objects, ACLs, transactions, notifications, volatile keys, 32-bit views, hive load/unload, remote registry | P1 |
-| Security (Se) | Simplified handle access masks | Tokens, SIDs, ACLs, privileges, impersonation, integrity, AppContainer, audit, security descriptors | P1 |
+| Security (Se) | Runtime-local users/groups, SID identities, process/thread tokens, Win32 privilege adjustment, impersonation, object ACLs, principal-aware VirtFS rules and handle access checks | Full Windows security descriptors and access-check APIs, NT token privilege adjustment, integrity, AppContainer, audit, persistent account database | P1 |
 | IPC | Named synchronization objects shared per runtime | ALPC/LPC, named pipes, mailslots, RPC, shared-memory sections | P1/P2 |
 | Loader / exceptions | PE mapping, imports, exports, relocations, process-attach TLS callbacks, partial loader | PEB/TEB, `LdrInitializeThunk`, `RtlUserThreadStart`, activation contexts/SxS, loader notifications, thread-attach/detach TLS, SEH/unwind, 64-bit CONTEXT | P0/P1 |
 | Diagnostics / tracing | TraceLog and basic OutputDebugString handling | Guest VEH dispatch, unhandled-exception filter, ETW, WER, WMI, crash dumps | P2 |
-| USER32 / GDI / win32k | Small App-layer window manager in `ImaginedNT.App`; no GDI, no win32k syscall layer | Dialogs, menus, hooks, clipboard, DPI/monitor APIs, scrollbars, layered windows, input injection; all GDI; `NtUser*`/`NtGdi*`; session/desktop/window-station objects | P1/P2 |
+| USER32 / GDI / win32k | Small App-layer window manager in `ImaginedNT.AppShared`; no GDI, no win32k syscall layer | Dialogs, menus, hooks, clipboard, DPI/monitor APIs, scrollbars, layered windows, input injection; all GDI; `NtUser*`/`NtGdi*`; session/desktop/window-station objects | P1/P2 |
 | Kernel-only facilities | Not implemented by design | HAL/ACPI/APIC, IRQL/DPC, scheduler, page tables/PFN database, drivers/PnP/power/DMA, bugcheck, kernel debugger, win32k/GDI | Out of scope |
 | 32-bit images | AMD64 only | PE32/i386, Wow64, 32-bit registry views | P2 |
 
@@ -54,7 +54,12 @@ Implemented:
 - `NtAllocateVirtualMemory`, `NtFreeVirtualMemory`, `NtProtectVirtualMemory`,
   `NtQueryVirtualMemory`, `NtLockVirtualMemory`, `NtUnlockVirtualMemory`.
 - Win32 wrappers: `VirtualAlloc`, `VirtualFree`, `VirtualProtect`, `VirtualQuery`,
-  their current-process `Ex` variants, and host-backed `VirtualLock`/`VirtualUnlock`.
+  their guest-process `Ex` variants with VM access checks, and host-backed `VirtualLock`/`VirtualUnlock`.
+- `ReadProcessMemory` / `WriteProcessMemory` and NT/Zw read/write entries resolve guest process handles.
+- Local/Global allocation, reallocation, release, lock/unlock, size/flags and handle lookup;
+  guest fixed-buffer compatibility keeps releases on the owning heap.
+- Guest heap enumeration, validation, compaction and walking; growable `RtlCreateHeap`,
+  `RtlDestroyHeap` and Rtl allocation/free/size aliases use the tracked heap lifecycle.
 - `GlobalMemoryStatus`/`Ex`, `GetPhysicallyInstalledSystemMemory`, and
   `GetPerformanceInfo`/`K32GetPerformanceInfo` report the isolated runtime's capacity,
   usage and availability. `GetProcessMemoryInfo`/`K32GetProcessMemoryInfo` and
@@ -86,6 +91,12 @@ not an OS physical-page quota: unmediated native allocations are not tracked. Gu
 and reporting APIs always use the runtime implementation. `LimitJobObject` is the separate host-wide OS
 commit backstop. `HeapReAlloc` checks net growth and leaves the old allocation charged on failure.
 
+Direct Local/Global, COM task-memory and BSTR API allocations are accounted by allocator family.
+Their ownership can pass to unmediated native code, so process cleanup drops these records without
+freeing the buffers again; the receiving owner remains responsible for its matching release API.
+Native releases outside the managed entry points can bypass accounting until an address is reused
+or the process is disposed.
+
 The memory layouts and counter meanings follow Microsoft's
 [MEMORYSTATUSEX](https://learn.microsoft.com/windows/win32/api/sysinfoapi/ns-sysinfoapi-memorystatusex)
 and [PROCESS_MEMORY_COUNTERS_EX](https://learn.microsoft.com/windows/win32/api/psapi/ns-psapi-process_memory_counters_ex)
@@ -103,8 +114,8 @@ Not implemented or only a facade:
 - AWE (`AllocateUserPhysicalPages`, `MapUserPhysicalPages`) and real large-page AWE.
 - COW, guard-page faults, write-watch, memory priority, page protection combos.
 - Most `NtQueryVirtualMemory` information classes; only a small subset is handled.
-- Complete heap-manager surface: `RtlCreateHeap` / `RtlDestroyHeap` /
-  `RtlValidateHeap` and several loader/CRT heap flags are still incomplete
+- Complete heap-manager surface: caller-provided `RtlCreateHeap` storage/locks/parameters,
+  and several loader/CRT heap flags are still incomplete
   (see `docs/REACTOS-STATUS.md`, item 5).
 
 ### 3.2 I/O manager (Io)
@@ -216,16 +227,18 @@ Not implemented:
 
 ### 3.7 Security (Se)
 
+Runtime-local accounts, password logon, SID and group matching, privilege assignment, process/thread tokens,
+impersonation, object ACLs and principal-aware filesystem rules are supported. Selected token queries,
+Win32 token duplication, AdjustTokenPrivileges and CreateProcessAsUser are managed; see [SECURITY.md](SECURITY.md).
+
 Not implemented:
 
-- Token objects (`NtCreateToken`, `NtOpenProcessToken`,
-  `NtOpenThreadToken`, `NtDuplicateToken`, `NtAdjustPrivilegesToken`).
-- SIDs, ACLs, security descriptors, access checks.
-- Impersonation, integrity levels, AppContainer / low-box tokens.
+- `NtCreateToken`, `NtDuplicateToken`, `NtAdjustPrivilegesToken` and the full token information surface.
+- Full Windows security descriptors and native access-check APIs.
+- Integrity levels, AppContainer / low-box tokens.
 - Audit and alarm APIs (`NtAccessCheckAndAuditAlarm`,
   `NtOpenObjectAuditAlarm`, ...).
-- The object manager currently checks simplified access masks, not the Windows
-  security reference monitor.
+- Persistent account storage and the full Windows security reference monitor.
 
 ### 3.8 IPC and cross-process facilities
 
@@ -269,7 +282,7 @@ Not implemented:
 Implemented (App layer only):
 
 - A window-manager subset: class registration, window creation, message
-  queue, basic controls, DWM stubs (`src/ImaginedNT.App/Gui`).
+  queue, basic controls, DWM stubs (`src/ImaginedNT.AppShared/Gui`).
 
 Not implemented:
 
@@ -295,7 +308,7 @@ require a real kernel or hypervisor:
 | `src/ImaginedNT.Apis.System/NtdllInitializationApis.cs:83-89` | `RtlAddVectoredExceptionHandler` / `RtlAddVectoredContinueHandler` return 1; removal returns 1 |
 | `src/ImaginedNT.Apis.System/SystemApis.cs:491-495` | `IsDebuggerPresent` returns 0; `SetUnhandledExceptionFilter` returns 0 |
 | `src/ImaginedNT.Apis.Synchronization/SynchronizationApis.cs:598` | `SuspendThread` returns 1 without suspending |
-| `src/ImaginedNT.App/Gui/WindowApis.cs:1013` | Callback-based `SetTimer` is intentionally unsupported |
+| `src/ImaginedNT.AppShared/Gui/WindowApis.cs:1013` | Callback-based `SetTimer` is intentionally unsupported |
 | `src/ImaginedNT.Apis.System/NtdllInitializationApis.cs:115` | `CsrClientConnectToServer` reports a virtual success but does not populate CSR/BASESRV data |
 | `src/ImaginedNT.Apis.System/NtdllInitializationApis.cs:98` | `LdrSetDllManifestProber` only stores callbacks, no prober |
 | `src/ImaginedNT.Apis.System/NtdllInitializationApis.cs:106` | `LdrDisableThreadCalloutsForDll` returns `STATUS_NOT_SUPPORTED` for images with TLS |
@@ -329,13 +342,13 @@ guest app
 ImaginedNT currently implements only a small **user32 API subset inside the App
 layer**. There is no `win32u.dll` interception, no `NtUser*`/`NtGdi*` dispatch and no
 win32k session/desktop object model. `ImaginedNT.Host` itself does not register the
-window APIs; only `ImaginedNT.App.Gui.GuiSession` adds `WindowApis` to its runtime,
+window APIs; the UI hosts add `ImaginedNT.AppShared.Gui.WindowApis` to their runtimes,
 with a XAML compositor attached through `WindowManager`.
 
 Evidence:
 
-- `src/ImaginedNT.App/Gui/WindowApis.cs` contains the user32 registrations.
-- `src/ImaginedNT.App/Gui/WindowManager.cs` owns classes, windows, geometry, z-order,
+- `src/ImaginedNT.AppShared/Gui/WindowApis.cs` contains the user32 registrations.
+- `src/ImaginedNT.AppShared/Gui/WindowManager.cs` owns classes, windows, geometry, z-order,
   focus and per-thread message queues; it intentionally contains no UWP types.
 - `BuiltinApis.Assemblies` does not include the App GUI assembly; the GUI is opt-in.
 - `NativeSyscallMap` parses only `%SystemRoot%\System32\ntdll.dll`. `win32u.dll` is

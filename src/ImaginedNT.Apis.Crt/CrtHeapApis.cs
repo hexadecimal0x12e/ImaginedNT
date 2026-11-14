@@ -59,7 +59,7 @@ public static partial class CrtHeapApis
         "api-ms-win-crt-private-l1-1-0!_o__free_base", "ucrtbase!_o__free_base")]
     private static ulong Free(ApiCallContext ctx)
     {
-        ctx.Process.Heap.Free(ctx.Arg(0), ctx.Thread.Id);
+        if (!ctx.Process.Heap.Free(ctx.Arg(0), ctx.Thread.Id)) CrtLocaleData.SetErrno(22);
         return 0;
     }
 
@@ -76,12 +76,27 @@ public static partial class CrtHeapApis
 
     [PartiallyImaginedApi(Module, "_msize", ApiCategory.Memory, "ucrtbase!_msize",
         "api-ms-win-crt-private-l1-1-0!_o__msize", "ucrtbase!_o__msize")]
-    private static ulong Size(ApiCallContext ctx) => ctx.Process.Heap.Size(ctx.Arg(0), ctx.Thread.Id);
+    private static ulong Size(ApiCallContext ctx)
+    {
+        var size = ctx.Process.Heap.Size(ctx.Arg(0), ctx.Thread.Id);
+        if (size == ulong.MaxValue) CrtLocaleData.SetErrno(22);
+        return size;
+    }
 
     [PartiallyImaginedApi(Module, "_expand", ApiCategory.Memory, "ucrtbase!_expand",
         "api-ms-win-crt-private-l1-1-0!_o__expand", "ucrtbase!_o__expand")]
-    private static ulong Expand(ApiCallContext ctx) => ValidSize(ctx, ctx.Arg(1))
-        ? ctx.Process.Heap.Reallocate(ctx.Arg(0), ctx.Arg(1), inPlace: true, threadId: ctx.Thread.Id) : 0;
+    private static ulong Expand(ApiCallContext ctx)
+    {
+        if (!ValidSize(ctx, ctx.Arg(1))) return 0;
+        if (!ctx.Process.Heap.Contains(ctx.Arg(0)))
+        {
+            CrtLocaleData.SetErrno(22);
+            return 0;
+        }
+        var result = ctx.Process.Heap.Reallocate(ctx.Arg(0), ctx.Arg(1), inPlace: true, threadId: ctx.Thread.Id);
+        if (result == 0) CrtLocaleData.SetErrno(12);
+        return result;
+    }
 
     private static ulong Allocate(ApiCallContext ctx, ulong size, bool zero = false)
     {
@@ -101,7 +116,7 @@ public static partial class CrtHeapApis
         if (address == 0) return Allocate(ctx, size, zero);
         if (size == 0)
         {
-            ctx.Process.Heap.Free(address, ctx.Thread.Id);
+            if (!ctx.Process.Heap.Free(address, ctx.Thread.Id)) CrtLocaleData.SetErrno(22);
             return 0;
         }
         do

@@ -10,6 +10,7 @@ using ImaginedNT.Core.Native;
 using ImaginedNT.Core.Objects;
 using ImaginedNT.Core.Pe;
 using ImaginedNT.Core.Thunks;
+using ImaginedNT.Core.Security;
 
 namespace ImaginedNT.Core.Runtime;
 
@@ -66,6 +67,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         foreach (var source in _dllRedirects.Keys) ResolveLibraryName(source);
         var console = Options.TraceToConsole ? (Options.DiagnosticWriter ?? Console.Error) : null;
         Trace = new TraceLog(console, Options.TraceFile);
+        Security = new SecurityAccounts(Trace);
         Memory = new ImaginedNT.Core.Memory.RuntimeMemory(Options.MaximumPhysicalMemoryBytes, Options.MaximumVirtualMemoryBytes, Trace);
         foreach (var source in _dllRedirects.Keys)
             Trace.Emit(TraceKind.Image, $"DLL redirect: {source}.dll -> {ResolveLibraryName(source)}");
@@ -198,6 +200,7 @@ public sealed unsafe class ImaginedRuntime : IDisposable
     public RuntimeOptions Options { get; }
     public Memory.RuntimeMemory Memory { get; }
     public TraceLog Trace { get; }
+    public SecurityAccounts Security { get; }
     public ApiRegistry Apis { get; }
     public NativeApiRegistry NativeDeclarations { get; }
     public INativeForwarder NativeApis { get; }
@@ -435,7 +438,11 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             var sessionId = options.SessionId ?? parent?.SessionId ?? Options.DefaultSessionId;
             var session = _sessions.GetValueOrDefault(sessionId)
                 ?? throw new InvalidOperationException($"session {sessionId} does not exist in this runtime");
+            var token = (options.Token ?? parent?.Token)?.Clone() ?? Security.SystemToken;
             var desktop = WindowStations.ResolveStartupDesktop(sessionId, parent, options.Desktop);
+            if ((desktop.Security is { } ds && !ds.Allows(token, 0x00020003)) ||
+                (desktop.WindowStation.Security is { } ws && !ws.Allows(token, 0x00020003)))
+                throw new UnauthorizedAccessException("process token cannot access the startup desktop");
 
             var pid = processId ?? 0;
             if (processId.HasValue)
@@ -468,11 +475,13 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             // Win32 guests expect a drive-qualified current directory (cmd.exe builds paths from
             // it); the sandbox maps C:\ to its root.
             var currentDirectory = options.CurrentDirectory ?? parent?.CurrentDirectory ?? "C:\\";
-            var environment = options.Environment ?? parent?.GetEnvironmentVariables() ?? VirtualEnvironment.Create(this, sandboxRoot);
+            var environment = options.Environment ?? (parent is not null && parent.Token.User.Sid == token.User.Sid
+                ? parent.GetEnvironmentVariables() : VirtualEnvironment.Create(this, sandboxRoot, token.User.Sid));
             var isRoot = options.IsRoot ?? _processes.Count == 0;
             var commandLine = options.CommandLine ?? $"\"{fullPath}\"";
             var process = new ImaginedProcess(this, pid, fullPath, commandLine, currentDirectory,
-                options.ParentId, sandboxRoot, environment, isRoot, session, desktop, entryPoint);
+                options.ParentId, sandboxRoot, environment, isRoot, session, desktop,
+                token, entryPoint);
             _processes.Add(process);
             Trace.Emit(TraceKind.Process,
                 $"runtime now owns {_processes.Count} imagined process(es); pid={pid} parent={(options.ParentId?.ToString() ?? "host")}", pid);
@@ -525,8 +534,12 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         _threadsByNativeId.TryGetValue(nativeId, out var thread) ? thread : null;
 
     /// <summary>Resolve the guest thread executing on the current host thread.</summary>
-    public ImaginedThread? GetCurrentThread() => _imaginedThread.Value is { IsFinished: false } thread
-        ? thread : FindThreadByNativeId(Native.NativeMethods.GetCurrentThreadId());
+    public ImaginedThread? GetCurrentThread()
+    {
+        var thread = FindThreadByNativeId(Native.NativeMethods.GetCurrentThreadId());
+        if (thread is { IsManagedHosted: true, IsImaginedEntry: false, IsFinished: false }) return thread;
+        return _imaginedThread.Value is { IsFinished: false } current ? current : thread;
+    }
 
     internal void SetImaginedThread(ImaginedThread? thread) => _imaginedThread.Value = thread;
 
@@ -697,13 +710,19 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         return ImportResolution.Native(WrapNativeImport(import, target), $"guest native {mapped.Image.FileName}!{import.DisplayName}");
     }
 
-    public static bool IsHostSystemModule(string module) =>
-        ApiRegistry.NormalizeModule(module) is
+    public static bool IsHostSystemModule(string module)
+    {
+        var name = ApiRegistry.NormalizeModule(module);
+        // CRT API sets keep the same per-guest state as ucrtbase.
+        if (name.StartsWith("api-ms-win-", StringComparison.Ordinal))
+            return !name.StartsWith("api-ms-win-crt-", StringComparison.Ordinal);
+        return name.StartsWith("ext-ms-win-", StringComparison.Ordinal) || name is
             "kernel32" or "kernelbase" or "ntdll" or "msvcrt" or "ucrtbase" or
             "user32" or "advapi32" or "gdi32" or "rpcrt4" or "ole32" or "oleaut32" or
             "shell32" or "shlwapi" or "comctl32" or "ws2_32" or "crypt32" or "sechost" or
             "setupapi" or "version" or "winmm" or "imm32" or "uxtheme" or "dwmapi" or
             "activeds" or "netapi32" or "wintrust" or "combase" or "coml2" or "comcat";
+    }
 
     // Keep the CRT mapped per guest for its startup, environment and stdio state.
     internal bool ShouldLoadLibraryNatively(string path) =>
@@ -885,6 +904,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         var context = new ApiCallContext(process, thread!, module, name, 0, returnAddress, copied, returnAddressSlot);
         try
         {
+            if (thread!.TerminationRequested && !thread.IsImaginedEntry)
+                throw new GuestThreadExitException(thread.TerminationExitCode);
             if (registration is null)
             {
                 if (!Options.AllowNativeForwarding || Options.ImportPolicy == ImportPolicy.ManagedOnly ||
@@ -894,6 +915,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
                 result = target == 0 ? Nt.NtStatus.EntrypointNotFound : NativeHandleBridge.Invoke(context, target);
             }
             else result = registration.Handler(context);
+            if (thread!.TerminationRequested && !thread.IsImaginedEntry)
+                context.PendingThreadExitCode = thread.TerminationExitCode;
             var lastError = ImaginedNT.Core.Native.NativeMethods.GetLastError();
             context.Complete(result);
             ImaginedNT.Core.Native.NativeMethods.SetLastError(lastError);
@@ -925,6 +948,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         }
         finally
         {
+            if (thread!.TerminationRequested && !thread.IsImaginedEntry)
+                context.PendingThreadExitCode = thread.TerminationExitCode;
             if (process.FaultExitCode is int code) context.PendingThreadExitCode = code;
             if (context.PendingThreadExitCode is not null) context.TryRedirectThreadExit();
         }
@@ -981,6 +1006,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
             }
 
             var result = registration.Handler(context);
+            if (thread.TerminationRequested && !thread.IsImaginedEntry)
+                context.PendingThreadExitCode = thread.TerminationExitCode;
             // Tracing writes files/console and would otherwise clobber the host thread's
             // last-error slot between the handler and the guest's next GetLastError.
             var lastError = ImaginedNT.Core.Native.NativeMethods.GetLastError();
@@ -1019,6 +1046,8 @@ public sealed unsafe class ImaginedRuntime : IDisposable
         }
         finally
         {
+            if (thread.TerminationRequested && !thread.IsImaginedEntry)
+                context.PendingThreadExitCode = thread.TerminationExitCode;
             if (process.FaultExitCode is int code) context.PendingThreadExitCode = code;
             if (context.PendingThreadExitCode is not null) context.TryRedirectThreadExit();
         }

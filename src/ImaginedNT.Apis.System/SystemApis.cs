@@ -551,7 +551,8 @@ public static class SystemApis
         if (string.IsNullOrEmpty(value)) return BoolResult(ctx, false, Win32Error.InvalidParameter);
         try
         {
-            var host = ctx.Process.FileSystem.MapPath(value, ctx.Process.CurrentDirectory, FileOperation.Enum);
+            var status = ctx.Process.FileSystem.TryMapPath(value, ctx.Process.CurrentDirectory, FileOperation.Enum, out var host);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
             if (!HostFileSystem.DirectoryExists(host))
             {
                 ctx.Runtime.Trace.Warn($"SetCurrentDirectoryW('{value}') failed: current='{ctx.Process.CurrentDirectory}', host='{host}'",
@@ -764,7 +765,8 @@ public static class SystemApis
         if (string.IsNullOrEmpty(name)) return 0;
         name = ctx.Runtime.ResolveLibraryName(name);
         if (ctx.Process.FindModuleByName(name) is { } existing) return existing.BaseAddress;
-        if (ctx.Runtime.Options.PreferHostSystemDlls && ImaginedRuntime.IsHostSystemModule(name) &&
+        if (ctx.Runtime.Options.PreferHostSystemDlls && ctx.Runtime.Options.AllowNativeForwarding &&
+            ctx.Runtime.Options.ImportPolicy != ImportPolicy.ManagedOnly && ImaginedRuntime.IsHostSystemModule(name) &&
             ApiRegistry.NormalizeModule(name) is not ("msvcrt" or "ucrtbase"))
         {
             var hostModule = ctx.Runtime.NativeApis.GetModuleHandle(name);

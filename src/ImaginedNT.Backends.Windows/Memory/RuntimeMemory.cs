@@ -23,6 +23,10 @@ public struct ProcessMemoryCounters
 public sealed record RuntimeMemorySnapshot(MemoryStatus Available,
     ProcessMemoryCounters Process, ulong VirtualBytes, ulong PeakVirtualBytes);
 
+public enum HostMemoryKind { Heap, Local, Global, ComTask, Bstr }
+
+public readonly record struct HostMemoryBlock(int ProcessId, ulong Heap, ulong Size, HostMemoryKind Kind);
+
 /// <summary>Guest allocation accounting shared by all processes in one runtime.</summary>
 public sealed class RuntimeMemory(ulong maximumPhysicalBytes = 0, ulong maximumVirtualBytes = 0, TraceLog? trace = null)
 {
@@ -38,7 +42,8 @@ public sealed class RuntimeMemory(ulong maximumPhysicalBytes = 0, ulong maximumV
     private readonly Usage _system = new();
     private ulong _systemPeakWorkingSet;
     private readonly Dictionary<int, Usage> _processes = new();
-    private readonly Dictionary<(ulong Heap, ulong Address), (int Pid, ulong Size)> _hostBlocks = new();
+    private readonly Dictionary<ulong, HostMemoryBlock> _hostBlocks = new();
+    private readonly Dictionary<ulong, GuestHeap> _guestHeaps = new();
     public object Gate { get; } = new();
     public ulong MaximumPhysicalBytes { get; } = maximumPhysicalBytes;
     public ulong MaximumVirtualBytes { get; } = maximumVirtualBytes;
@@ -46,6 +51,26 @@ public sealed class RuntimeMemory(ulong maximumPhysicalBytes = 0, ulong maximumV
     public void RegisterProcess(int pid)
     {
         lock (Gate) _processes.TryAdd(pid, new());
+    }
+
+    public GuestHeap? FindGuestHeap(ulong handle)
+    {
+        lock (Gate) return _guestHeaps.GetValueOrDefault(handle);
+    }
+
+    public GuestHeap? FindGuestBlock(ulong address)
+    {
+        lock (Gate) return _guestHeaps.Values.FirstOrDefault(h => h.ContainsAddress(address));
+    }
+
+    internal void RegisterGuestHeap(ulong handle, GuestHeap heap)
+    {
+        lock (Gate) _guestHeaps.Add(handle, heap);
+    }
+
+    internal void ForgetGuestHeap(ulong handle)
+    {
+        lock (Gate) _guestHeaps.Remove(handle);
     }
 
     public RuntimeMemorySnapshot GetSnapshot(int? pid = null)
@@ -132,8 +157,32 @@ public sealed class RuntimeMemory(ulong maximumPhysicalBytes = 0, ulong maximumV
 
     public ulong GetHostBlockSize(ulong heap, ulong address)
     {
-        lock (Gate) return _hostBlocks.GetValueOrDefault((heap, address)).Size;
+        lock (Gate) return _hostBlocks.TryGetValue(address, out var block) && block.Heap == heap ? block.Size : 0;
     }
+
+    public bool TryGetHostBlock(ulong address, out HostMemoryBlock block)
+    {
+        lock (Gate) return _hostBlocks.TryGetValue(address, out block);
+    }
+
+    public bool CanUseHostBlock(ulong address, HostMemoryKind kind)
+    {
+        lock (Gate) return address == 0 || FindGuestBlock(address) is null &&
+            (!_hostBlocks.TryGetValue(address, out var block) || block.Kind == kind);
+    }
+
+    public bool PrepareHostAllocation(ulong size, ulong oldSize = 0)
+    {
+        lock (Gate)
+        {
+            if (size > long.MaxValue - 15) return false;
+            var charged = ChargeSize(size);
+            var extra = charged > oldSize ? charged - oldSize : 0;
+            return CanAllocate(extra, extra) && PrepareHostAllocation();
+        }
+    }
+
+    public static ulong ChargeSize(ulong size) => (Math.Max(size, 1UL) + 15) & ~15UL;
 
     public bool PrepareHostAllocation()
     {
@@ -149,38 +198,53 @@ public sealed class RuntimeMemory(ulong maximumPhysicalBytes = 0, ulong maximumV
         }
     }
 
-    public void TrackHostAllocation(int pid, ulong heap, ulong oldAddress, ulong address, ulong size)
+    public void TrackHostAllocation(int pid, ulong heap, ulong oldAddress, ulong address, ulong size,
+        HostMemoryKind kind = HostMemoryKind.Heap)
     {
         lock (Gate)
         {
-            if (_hostBlocks.Remove((heap, oldAddress), out var old))
+            if (oldAddress != 0 && _hostBlocks.Remove(oldAddress, out var old))
             {
-                pid = old.Pid;
-                UpdateUsage(pid, old.Size, old.Size, size, size);
+                pid = old.ProcessId;
+                UpdateUsage(pid, old.Size, old.Size, 0, 0);
             }
-            else UpdateUsage(pid, 0, 0, size, size);
-            _hostBlocks.Add((heap, address), (pid, size));
+            // 原生组件可能已释放并复用了地址，旧记录不能阻止新分配入账。
+            if (_hostBlocks.Remove(address, out var previous))
+                UpdateUsage(previous.ProcessId, previous.Size, previous.Size, 0, 0);
+            UpdateUsage(pid, 0, 0, size, size);
+            _hostBlocks.Add(address, new(pid, heap, size, kind));
         }
     }
 
     public void ForgetHostAllocation(ulong heap, ulong address)
     {
         lock (Gate)
-            if (_hostBlocks.Remove((heap, address), out var block)) UpdateUsage(block.Pid, block.Size, block.Size, 0, 0);
+            if (_hostBlocks.TryGetValue(address, out var block) && block.Heap == heap)
+            {
+                _hostBlocks.Remove(address);
+                UpdateUsage(block.ProcessId, block.Size, block.Size, 0, 0);
+            }
     }
 
     public void FreeHostAllocations(int pid)
     {
         lock (Gate)
         {
-            foreach (var block in _hostBlocks.Where(b => b.Value.Pid == pid).ToArray())
+            foreach (var block in _hostBlocks.Where(b => b.Value.ProcessId == pid).ToArray())
             {
-                if (NativeMethods.HeapFree((nint)block.Key.Heap, 0, (nint)block.Key.Address))
-                    ForgetHostAllocation(block.Key.Heap, block.Key.Address);
-                else trace?.Warn($"could not free guest block on host heap at 0x{block.Key.Address:X}", pid);
+                if (block.Value.Kind != HostMemoryKind.Heap)
+                {
+                    // 这些分配允许向原生组件转移所有权，退出时仅撤销记账。
+                    ForgetHostAllocation(block.Value.Heap, block.Key);
+                    continue;
+                }
+                var freed = NativeMethods.HeapFree((nint)block.Value.Heap, 0, (nint)block.Key);
+                if (freed) ForgetHostAllocation(block.Value.Heap, block.Key);
+                else trace?.Warn($"could not free {block.Value.Kind} block at 0x{block.Key:X}", pid);
             }
         }
     }
 
     private static ulong Remaining(ulong total, ulong used) => used < total ? total - used : 0;
+
 }

@@ -1,5 +1,6 @@
 using ImaginedNT.FullTrustApp.Hosting;
 using ImaginedNT.FullTrustApp.Pages;
+using ImaginedNT.FullTrustApp.MockWindows;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 
@@ -11,6 +12,8 @@ public sealed partial class MainPage : Page
     private readonly Dictionary<string, Page> _pages;
     private bool _loaded;
     private int _ticks;
+    private VirtualWindowsSession? _desktopWindow;
+    private HostSession? _desktopSession;
 
     public MainPage()
     {
@@ -18,7 +21,6 @@ public sealed partial class MainPage : Page
         _pages = new()
         {
             ["terminal"] = new TerminalPage(),
-            ["desktop"] = new DesktopPage(),
             ["stations"] = new WindowStationsPage(),
             ["processes"] = new ProcessesPage(),
             ["objects"] = new ObjectsPage(),
@@ -32,7 +34,7 @@ public sealed partial class MainPage : Page
         AppRuntime.Changed += UpdateHeader;
         AppRuntime.NavigationRequested += Navigate;
         _timer.Tick += OnTick;
-        Navigation.SelectedItem = Navigation.MenuItems[0];
+        Navigation.SelectedItem = Navigation.MenuItems.OfType<NavigationViewItem>().First(i => (string)i.Tag == "terminal");
         UpdateHeader();
     }
 
@@ -44,15 +46,34 @@ public sealed partial class MainPage : Page
         await ((TerminalPage)_pages["terminal"]).StartAsync();
     }
 
-    private void Navigate(string page) => Navigation.SelectedItem = Navigation.MenuItems
-        .OfType<NavigationViewItem>().First(i => (string)i.Tag == page);
+    private void Navigate(string page)
+    {
+        if (page == "desktop") { ShowDesktop(); return; }
+        Navigation.SelectedItem = Navigation.MenuItems.OfType<NavigationViewItem>().First(i => (string)i.Tag == page);
+    }
+
+    private void ShowDesktop()
+    {
+        if (_desktopWindow is null)
+        {
+            _desktopWindow = new VirtualWindowsSession();
+            _desktopWindow.Closed += (_, _) => _desktopWindow = null;
+        }
+        _desktopWindow.Activate();
+    }
 
     private void OnNavigationChanged(NavigationView sender, NavigationViewSelectionChangedEventArgs args)
     {
         if (args.SelectedItem is not NavigationViewItem item || _pages is null) return;
+        if ((string)item.Tag == "desktop")
+        {
+            ShowDesktop();
+            Navigation.SelectedItem = Navigation.MenuItems.OfType<NavigationViewItem>().First(i =>
+                _pages.TryGetValue((string)i.Tag, out var page) && ReferenceEquals(page, PageHost.Content));
+            return;
+        }
         PageHost.Content = _pages[(string)item.Tag];
         AppRuntime.SetMessage("");
-        if (PageHost.Content is DesktopPage desktop) desktop.Sync();
         _ = RefreshPageAsync();
     }
 
@@ -62,7 +83,6 @@ public sealed partial class MainPage : Page
         {
             AppRuntime.DrainOutput();
             ((TerminalPage)_pages["terminal"]).RefreshOutput();
-            if (PageHost.Content is DesktopPage desktop) desktop.Sync();
             if (++_ticks < 10) return;
             _ticks = 0;
             _ = RefreshPageAsync();
@@ -109,6 +129,12 @@ public sealed partial class MainPage : Page
     {
         StatusText.Text = AppRuntime.Status;
         PageError.Text = AppRuntime.Error;
+        if (AppRuntime.Session is null) _desktopSession = null;
+        if (!AppRuntime.IsStopping && !AppRuntime.IsClosed && AppRuntime.Session is { } session && !ReferenceEquals(_desktopSession, session))
+        {
+            _desktopSession = session;
+            ShowDesktop();
+        }
     }
 
     public async Task ShutdownAsync()
@@ -117,6 +143,8 @@ public sealed partial class MainPage : Page
         try { await AppRuntime.ShutdownAsync(); }
         finally
         {
+            _desktopWindow?.Close();
+            _desktopWindow = null;
             AppRuntime.BugChecked -= OnBugChecked;
             AppRuntime.Changed -= UpdateHeader;
             AppRuntime.NavigationRequested -= Navigate;

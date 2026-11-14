@@ -18,6 +18,16 @@ public sealed class HandleEntry
 /// <summary>Per-process handle table.  Handles are small 4-byte-aligned integers, just like NT.</summary>
 public sealed class HandleTable : IDisposable
 {
+    private static uint NormalizeAccess(NtObject obj, uint access)
+    {
+        if (obj is not Io.FileObject) return access;
+        if ((access & NtAccess.GenericAll) != 0) access = (access & ~NtAccess.GenericAll) | 0x001F01FF;
+        if ((access & NtAccess.GenericRead) != 0) access = (access & ~NtAccess.GenericRead) | 0x00120089;
+        if ((access & NtAccess.GenericWrite) != 0) access = (access & ~NtAccess.GenericWrite) | 0x00120116;
+        if ((access & NtAccess.GenericExecute) != 0) access = (access & ~NtAccess.GenericExecute) | 0x001200A0;
+        return access;
+    }
+
     private readonly object _gate = new();
     private readonly Dictionary<ulong, HandleEntry> _handles = new();
     private readonly TraceLog? _trace;
@@ -102,6 +112,18 @@ public sealed class HandleTable : IDisposable
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            grantedAccess = NormalizeAccess(obj, grantedAccess);
+            if (obj.Security is { } security)
+            {
+                var token = TokenProvider?.Invoke();
+                var allowed = token is null ? 0 : NormalizeAccess(obj, security.GetAllowedAccess(token));
+                if ((grantedAccess & ~NtAccess.MaximumAllowed & ~allowed) != 0 || (token is null && grantedAccess != 0))
+                {
+                    _trace?.Emit(TraceKind.Security, $"denied open {obj.TypeName} '{name ?? obj.FullPath}' access=0x{grantedAccess:X}", _pid);
+                    return 0;
+                }
+                if ((grantedAccess & NtAccess.MaximumAllowed) != 0) grantedAccess = allowed;
+            }
             var handle = fixedHandle != 0 ? fixedHandle : AllocateHandle();
             if (fixedHandle == 0 && handle == 0) handle = AllocateHandle();
             if (_handles.TryGetValue(handle, out var existing))
@@ -127,6 +149,7 @@ public sealed class HandleTable : IDisposable
     /// <summary>Seed a fixed handle (used for stdin/stdout/stderr and handle inheritance).</summary>
     public void Seed(ulong handle, NtObject obj, uint access = 0x01FF_FFFF, bool inheritable = false)
     {
+        access = NormalizeAccess(obj, access);
         lock (_gate)
         {
             if (_handles.TryGetValue(handle, out var existing))
@@ -172,6 +195,7 @@ public sealed class HandleTable : IDisposable
     }
 
     public const uint HandleFlagInherit = 0x0000_0001;
+    public Func<Security.AccessToken?>? TokenProvider { get; init; }
     public const uint HandleFlagProtectFromClose = 0x0000_0002;
 
     private ulong AllocateHandle()
@@ -192,6 +216,7 @@ public sealed class HandleTable : IDisposable
         lock (_gate)
         {
             if (!_handles.TryGetValue(handle, out var entry)) return NtStatus.InvalidHandle;
+            desiredAccess = NormalizeAccess(entry.Object, desiredAccess);
             var missing = desiredAccess & ~entry.GrantedAccess & ~NtAccess.MaximumAllowed;
             if (missing != 0) return NtStatus.AccessDenied;
             obj = entry.Object;
@@ -222,7 +247,8 @@ public sealed class HandleTable : IDisposable
         lock (_gate)
         {
             if (!_handles.TryGetValue(source, out var entry)) return NtStatus.InvalidHandle;
-            var access = desiredAccess == 0 ? entry.GrantedAccess : desiredAccess;
+            var access = desiredAccess == 0 ? entry.GrantedAccess : NormalizeAccess(entry.Object, desiredAccess);
+            if ((access & ~entry.GrantedAccess) != 0) return NtStatus.AccessDenied;
             if (entry.Object is ImaginedHandle native)
             {
                 var process = Native.NativeMethods.GetCurrentProcess();

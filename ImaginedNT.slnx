@@ -19,11 +19,12 @@
     <Project Path="tests/ImaginedNT.Tests/ImaginedNT.Tests.csproj" />
   </Folder>
   <Folder Name="/2. App/">
-    <Project Path="src/ImaginedNT.FullTrustApp/ImaginedNT.FullTrustApp.csproj" Id="d5322a63-0af0-4bb1-bc1c-0efe57fa9caf">
+    <Project Path="src/ImaginedNT.App/ImaginedNT.App.csproj" Id="d387eae8-1aa5-4225-b985-ab2f6f2977bd">
       <Platform Project="x64" />
       <Deploy />
     </Project>
-    <Project Path="src/ImaginedNT.App/ImaginedNT.App.csproj" Id="d387eae8-1aa5-4225-b985-ab2f6f2977bd">
+    <Project Path="src/ImaginedNT.AppShared/ImaginedNT.AppShared.csproj" />
+    <Project Path="src/ImaginedNT.FullTrustApp/ImaginedNT.FullTrustApp.csproj" Id="d5322a63-0af0-4bb1-bc1c-0efe57fa9caf">
       <Platform Project="x64" />
       <Deploy />
     </Project>

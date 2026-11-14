@@ -1,13 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using ImaginedNT.App.Gui;
+using ImaginedNT.AppShared.Gui;
 using ImaginedNT.FullTrustApp.Gui;
 using ImaginedNT.FullTrustApp.Hosting;
 using Microsoft.UI.Xaml.Media.Imaging;
 using System.Runtime.InteropServices.WindowsRuntime;
 using Windows.Foundation;
-using Windows.System;
 using Windows.UI;
 using Microsoft.UI.Input;
 using Microsoft.UI.Xaml;
@@ -67,6 +66,7 @@ public sealed partial class DwmCompositor : UserControl
     private readonly Dictionary<InputSystemCursorShape, InputSystemCursor> _cursors = new();
     private int _pressedButton = -1;
     private Window? _hostWindow;
+    private Window? _ownerWindow;
     private bool _restoreKeyboardFocus;
     private ImaginedNT.Core.Runtime.DesktopObject? _desktop;
 
@@ -91,6 +91,14 @@ public sealed partial class DwmCompositor : UserControl
     }
 
     public int WindowCount => _visuals.Values.Count(v => !v.IsChild);
+
+    public void SetHostWindow(Window? window)
+    {
+        _ownerWindow = window;
+        if (_hostWindow is not null) _hostWindow.Activated -= OnHostActivated;
+        _hostWindow = window;
+        if (_hostWindow is not null) _hostWindow.Activated += OnHostActivated;
+    }
 
     public void Attach(WindowManager? manager)
     {
@@ -182,7 +190,7 @@ public sealed partial class DwmCompositor : UserControl
     {
         if (_hostWindow is null)
         {
-            _hostWindow = (Application.Current as App)?.MainWindow;
+            _hostWindow = _ownerWindow ?? (Application.Current as App)?.MainWindow;
             if (_hostWindow is not null) _hostWindow.Activated += OnHostActivated;
         }
         if (_manager is not null)
@@ -724,40 +732,14 @@ public sealed partial class DwmCompositor : UserControl
 
     private void OnKeyDown(object sender, KeyRoutedEventArgs args)
     {
-        var manager = _manager;
-        if (manager is null) return;
-        var key = (int)args.Key;
-        if (key is <= 0 or > 255) return;
-        if (!manager.KeyDown(key, args.KeyStatus.ScanCode, args.KeyStatus.IsExtendedKey, args.KeyStatus.WasKeyDown)) return;
-        var character = args.Key switch
-        {
-            VirtualKey.Enter => '\r',
-            VirtualKey.Back => '\b',
-            VirtualKey.Tab => '\t',
-            _ => '\0'
-        };
-        if (character != '\0')
-        {
-            manager.Character(character);
-            args.Handled = true;
-        }
-        else
-        {
-            // Handling printable keys here suppresses the following CharacterReceived event.
-            args.Handled = args.Key is VirtualKey.Escape or VirtualKey.Left or VirtualKey.Right or
-                VirtualKey.Up or VirtualKey.Down or VirtualKey.Home or VirtualKey.End or
-                VirtualKey.PageUp or VirtualKey.PageDown or VirtualKey.Insert or VirtualKey.Delete ||
-                key >= (int)VirtualKey.F1 && key <= (int)VirtualKey.F24;
-        }
+        if (CompositorInput.KeyDown(_manager, (int)args.Key, args.KeyStatus.ScanCode,
+            args.KeyStatus.IsExtendedKey, args.KeyStatus.WasKeyDown) is bool handled)
+            args.Handled = handled;
     }
 
     private void OnKeyUp(object sender, KeyRoutedEventArgs args)
     {
-        var manager = _manager;
-        if (manager is null) return;
-        var key = (int)args.Key;
-        if (key is <= 0 or > 255) return;
-        if (manager.KeyUp(key, args.KeyStatus.ScanCode, args.KeyStatus.IsExtendedKey))
+        if (CompositorInput.KeyUp(_manager, (int)args.Key, args.KeyStatus.ScanCode, args.KeyStatus.IsExtendedKey))
             args.Handled = true;
     }
 

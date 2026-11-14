@@ -68,7 +68,7 @@ public static class ImaginedRegistry
             if (IsRoot(ctx.Arg(0)))
             {
                 var store = GetStore(ctx.Runtime, ctx.Process.FileSystem.Root);
-                key = new(store, store.Root(ctx.Arg32(0)), RegistryStore.RootNames[ctx.Arg32(0)]);
+                key = new(store, store.Root(ctx.Arg32(0), ctx.Thread.EffectiveToken.User.Sid), RegistryStore.RootNames[ctx.Arg32(0)]);
             }
             else
             {
@@ -81,6 +81,7 @@ public static class ImaginedRegistry
             lock (key.Store.Gate)
             {
                 if (key.Key.Deleted) return KeyDeleted;
+                if (!CanAccessKey(ctx, key, access)) return Win32Error.AccessDenied;
                 if ((access & (SetValue | CreateSubKey | Delete)) != 0 && !ctx.Process.FileSystem.AllowWrites)
                     return Win32Error.AccessDenied;
                 return action(key);
@@ -96,6 +97,15 @@ public static class ImaginedRegistry
                 _ => 1016 // ERROR_REGISTRY_IO_FAILED
             };
         }
+    }
+
+    private static bool CanAccessKey(ApiCallContext ctx, RegistryKeyObject key, uint access)
+    {
+        var token = ctx.Thread.EffectiveToken;
+        if (token.IsSystem || token.Match("Administrators") >= 0) return true;
+        if (key.Path.StartsWith("HKEY_USERS", StringComparison.OrdinalIgnoreCase)) return false;
+        return (access & (SetValue | CreateSubKey | Delete | 0x000C0000)) == 0 ||
+            key.Path.StartsWith("HKEY_CURRENT_USER", StringComparison.OrdinalIgnoreCase);
     }
 
     private static uint NormalizeAccess(ref uint access)
@@ -158,6 +168,7 @@ public static class ImaginedRegistry
         if (!ValidPath(path)) return Win32Error.InvalidParameter;
         return WithKey(ctx, 0, key =>
         {
+            if (!CanAccessKey(ctx, key, access)) return Win32Error.AccessDenied;
             var target = RegistryStore.Find(key.Key, path);
             if (target is null) return Win32Error.FileNotFound;
             ctx.Write(result, NewHandle(ctx, key, target, path, access));

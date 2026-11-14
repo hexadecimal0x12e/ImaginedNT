@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using ImaginedNT.Core.Com;
+using ImaginedNT.Core.Memory;
 using ImaginedNT.Core.Runtime;
 
 namespace ImaginedNT.Apis.Com;
@@ -151,32 +152,68 @@ public static class ComApis
 
     [VirtualApi("ole32.dll", "CoTaskMemAlloc", ApiCategory.Com, "combase.dll!CoTaskMemAlloc")]
     private static ulong CoTaskMemAlloc(ApiCallContext context)
+        => AllocateTaskMemory(context, context.Arg(0));
+
+    private static ulong AllocateTaskMemory(ApiCallContext context, ulong size)
     {
-        var size = context.Arg(0);
-        if (size == 0 || size > int.MaxValue) return 0;
-        return (ulong)(long)Marshal.AllocCoTaskMem((int)size);
+        lock (context.Runtime.Memory.Gate)
+        {
+            if (!context.Runtime.Memory.PrepareHostAllocation(size)) return 0;
+            var result = HostCoTaskMemAlloc((nuint)size);
+            if (result != 0) context.Runtime.Memory.TrackHostAllocation(context.Process.Id, 0, 0, (ulong)result,
+                RuntimeMemory.ChargeSize(size), HostMemoryKind.ComTask);
+            return (ulong)result;
+        }
     }
 
     [VirtualApi("ole32.dll", "CoTaskMemFree", ApiCategory.Com, "combase.dll!CoTaskMemFree")]
     private static ulong CoTaskMemFree(ApiCallContext context)
     {
-        if (context.Arg(0) != 0) Marshal.FreeCoTaskMem((IntPtr)(long)context.Arg(0));
+        lock (context.Runtime.Memory.Gate)
+        {
+            if (!ValidTaskMemory(context, context.Arg(0))) return 0;
+            if (context.Arg(0) != 0) Marshal.FreeCoTaskMem((nint)context.Arg(0));
+            context.Runtime.Memory.ForgetHostAllocation(0, context.Arg(0));
+        }
         return 0;
     }
 
     [VirtualApi("ole32.dll", "CoTaskMemRealloc", ApiCategory.Com, "combase.dll!CoTaskMemRealloc")]
     private static ulong CoTaskMemRealloc(ApiCallContext context)
     {
-        var pointer = (IntPtr)(long)context.Arg(0);
+        var pointer = context.Arg(0);
         var size = context.Arg(1);
-        if (size == 0)
+        lock (context.Runtime.Memory.Gate)
         {
-            if (pointer != IntPtr.Zero) Marshal.FreeCoTaskMem(pointer);
-            return 0;
+            if (!ValidTaskMemory(context, pointer)) return 0;
+            if (pointer != 0 && size == 0)
+            {
+                Marshal.FreeCoTaskMem((nint)pointer);
+                context.Runtime.Memory.ForgetHostAllocation(0, pointer);
+                return 0;
+            }
+            var oldSize = context.Runtime.Memory.GetHostBlockSize(0, pointer);
+            if (!context.Runtime.Memory.PrepareHostAllocation(size, oldSize)) return 0;
+            var result = HostCoTaskMemRealloc((nint)pointer, (nuint)size);
+            if (result != 0) context.Runtime.Memory.TrackHostAllocation(context.Process.Id, 0, pointer, (ulong)result,
+                RuntimeMemory.ChargeSize(size), HostMemoryKind.ComTask);
+            else if (size == 0) context.Runtime.Memory.ForgetHostAllocation(0, pointer);
+            return (ulong)result;
         }
-        if (size > int.MaxValue) return 0;
-        return (ulong)(long)Marshal.ReAllocCoTaskMem(pointer, (int)size);
     }
+
+    private static bool ValidTaskMemory(ApiCallContext context, ulong pointer)
+    {
+        if (context.Runtime.Memory.CanUseHostBlock(pointer, HostMemoryKind.ComTask)) return true;
+        context.Runtime.Trace.Warn($"{context.Name}: incompatible allocator for 0x{pointer:X}", context.Process.Id, context.Thread.Id);
+        return false;
+    }
+
+    [DllImport("ole32.dll", EntryPoint = "CoTaskMemAlloc")]
+    private static extern nint HostCoTaskMemAlloc(nuint size);
+
+    [DllImport("ole32.dll", EntryPoint = "CoTaskMemRealloc")]
+    private static extern nint HostCoTaskMemRealloc(nint memory, nuint size);
 
     [VirtualApi("ole32.dll", "CoCreateGuid", ApiCategory.Com, "combase.dll!CoCreateGuid")]
     private static ulong CoCreateGuid(ApiCallContext context)
@@ -194,8 +231,12 @@ public static class ComApis
             return ComHResult.AsReturnValue(ComHResult.E_INVALIDARG);
         var output = context.Arg(1);
         if (output == 0) return ComHResult.AsReturnValue(ComHResult.E_POINTER);
-        var pointer = Marshal.StringToCoTaskMemUni(ComMarshaling.FormatGuid(guid));
-        context.Memory.Write(output, (ulong)(long)pointer);
+        if (!context.Memory.IsWritable(output, 8)) return ComHResult.AsReturnValue(ComHResult.E_POINTER);
+        var bytes = System.Text.Encoding.Unicode.GetBytes(ComMarshaling.FormatGuid(guid) + '\0');
+        var pointer = AllocateTaskMemory(context, (ulong)bytes.Length);
+        context.Write(output, pointer);
+        if (pointer == 0) return ComHResult.AsReturnValue(ComHResult.E_OUTOFMEMORY);
+        context.WriteBytes(pointer, bytes);
         return ComHResult.AsReturnValue(ComHResult.S_OK);
     }
 

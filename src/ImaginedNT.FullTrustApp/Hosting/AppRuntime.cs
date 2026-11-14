@@ -1,6 +1,6 @@
 using System.Text.Json;
 using ImaginedNT.Core.Io;
-using ImaginedNT.App.Settings;
+using ImaginedNT.AppShared.Settings;
 using ImaginedNT.Core.Diagnostics;
 using ImaginedNT.Core.Runtime;
 
@@ -117,9 +117,8 @@ internal static class AppRuntime
                 if (p.Key == 'C') options.SandboxRoot = table.Options.HostDirectory;
             }
             EnsureSamples();
-            var fs = new SandboxFileSystem(options.SandboxRoot!, options.AllowFileWrites, drives: options.Drives);
             var image = !options.ExecuteImage ? "" : Path.IsPathFullyQualified(imagePath) ? Path.GetFullPath(imagePath)
-                : DriveYaml.ContainsKey('C') ? fs.MapPath(imagePath, "C:\\", FileOperation.Execute)
+                : DriveYaml.ContainsKey('C') ? imagePath
                 : Path.GetFullPath(imagePath, SandboxRoot);
             session = new HostSession(options, Log);
             session.Runtime.BugChecked += message => BugChecked?.Invoke(message);
@@ -134,6 +133,7 @@ internal static class AppRuntime
                 Changed?.Invoke();
             }
         }
+        catch (OperationCanceledException) when (IsStopping || IsClosed) { }
         catch (Exception ex) { ReportError("启动或运行来宾", ex); }
         finally
         {

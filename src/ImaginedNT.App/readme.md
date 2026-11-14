@@ -1,7 +1,7 @@
 # App
 
-A simple UWP host for ImaginedNT that also contains the **UI-layer window personality** (USER32
-and DWM).  The same app runs on Windows 10/11 desktop and other UWP-Compact targets supported by
+A simple UWP host for ImaginedNT using the **UI-layer window personality** (USER32
+and DWM) from `ImaginedNT.AppShared`.  The same app runs on Windows 10/11 desktop and other UWP-Compact targets supported by
 the runtime (x64 for guest execution).
 
 ## Window desktop
@@ -9,17 +9,17 @@ the runtime (x64 for guest execution).
 The `窗口桌面` navigation page starts `samples/bin/window.exe` in a second `ImaginedRuntime` and
 shows its windows through `Controls/DwmCompositor.xaml`:
 
-- `Gui/WindowManager.cs` owns the App-side window classes, geometry, z-order, focus, system
+- `../ImaginedNT.AppShared/Gui/WindowManager.cs` owns the App-side window classes, geometry, z-order, focus, system
   colours, per-guest-thread message queues, timers and pointer/key state.
-- `Gui/WindowApis.cs` implements the minimal USER32 surface used by plain `CreateWindowExW`
+- `../ImaginedNT.AppShared/Gui/WindowApis.cs` implements the minimal USER32 surface used by plain `CreateWindowExW`
   applications: class registration, create/show/destroy, message loop (`GetMessageW`,
   `PeekMessageW`, `DispatchMessageW`, `PostMessageW`, `SendMessageW`, `DefWindowProcW`),
   window text/geometry/z-order/focus, mouse and keyboard state, and timers.
-- `Gui/DwmApis.cs` reports composition as enabled and accepts the common window-attribute calls.
+- `../ImaginedNT.AppShared/Gui/DwmApis.cs` reports composition as enabled and accepts the common window-attribute calls.
 - `Controls/DwmCompositor.xaml` is the simplest DWM compositor: each top-level guest window is a
   XAML surface with an App-drawn caption and client area, child `STATIC`/`BUTTON` windows are XAML
   controls, and the compositor forwards pointer/keyboard events into the guest message queues.
-- `Gui/GuiSession.cs` creates the runtime, registers the App API assembly and owns the manager.
+- `Gui/GuiSession.cs` creates the runtime, registers the AppShared API assembly and owns the manager.
 
 There is deliberately **no GDI**: the guest supplies geometry, titles, child-control ids and
 window messages, while XAML draws the chrome, backgrounds and text.  Painting APIs

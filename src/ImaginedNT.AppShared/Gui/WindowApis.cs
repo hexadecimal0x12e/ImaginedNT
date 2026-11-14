@@ -3,7 +3,7 @@ using System.Text;
 using ImaginedNT.Core.Nt;
 using ImaginedNT.Core.Runtime;
 
-namespace ImaginedNT.App.Gui;
+namespace ImaginedNT.AppShared.Gui;
 
 /// <summary>
 /// Minimal managed USER32 backed by <see cref="WindowManager"/>.  It deliberately implements

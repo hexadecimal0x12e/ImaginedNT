@@ -190,6 +190,8 @@ public static class WindowStationApis
     {
         if (Get<DesktopObject>(ctx, ctx.Arg(0), 0x100) is not { } desktop) return 0;
         if (desktop.WindowStation != ctx.Process.WindowStation) return Fail(ctx, Win32Error.AccessDenied);
+        if (Manager(ctx).GetInputDesktop(ctx.Process.SessionId)?.Security is { } security &&
+            !security.Allows(ctx.Thread.EffectiveToken, 0x100)) return Fail(ctx, Win32Error.AccessDenied);
         Manager(ctx).SwitchDesktop(desktop);
         return 1;
     });

@@ -1,4 +1,5 @@
 using ImaginedNT.Core.Io;
+using ImaginedNT.Core.Nt;
 using ImaginedNT.Core.Runtime;
 using Microsoft.Win32.SafeHandles;
 
@@ -28,6 +29,12 @@ internal sealed partial class CrtStdioState
             mode.Length is < 1 or > 2 || mode[0] is not ('r' or 'w') ||
             mode.Length == 2 && mode[1] is not ('b' or 't')) return Error(ctx, name, 22);
         if (StreamCount >= _maxStdio) return Error(ctx, name, 24);
+        var shell = ctx.Process.TryGetEnvironmentVariable("COMSPEC", out var comspec)
+            ? comspec : "C:\\Windows\\System32\\cmd.exe";
+        var status = ctx.Process.FileSystem.TryMapPath(shell, ctx.Process.CurrentDirectory, FileOperation.Execute, out _);
+        if (status != NtStatus.Success) return Error(ctx, name, FileErrno(status));
+        status = ctx.Process.FileSystem.TryMapPath(shell, ctx.Process.CurrentDirectory, FileOperation.Read, out var image);
+        if (status != NtStatus.Success) return Error(ctx, name, FileErrno(status));
         var fds = stackalloc int[2];
         var flags = mode.Contains('b') ? 0x8000 : 0x4000;
         if ((int)Native.Call("_pipe", [(ulong)fds, 4096, (ulong)flags]) != 0) return 0;
@@ -51,10 +58,6 @@ internal sealed partial class CrtStdioState
             var pipeHandle = ctx.Handles.Create(file);
             try
             {
-                var shell = ctx.Process.TryGetEnvironmentVariable("COMSPEC", out var comspec)
-                    ? comspec : "C:\\Windows\\System32\\cmd.exe";
-                _ = ctx.Process.FileSystem.MapPath(shell, ctx.Process.CurrentDirectory, FileOperation.Execute);
-                var image = ctx.Process.FileSystem.MapPath(shell, ctx.Process.CurrentDirectory);
                 if (!File.Exists(image)) image = Path.Combine(Environment.SystemDirectory, "cmd.exe");
                 child = ctx.Runtime.CreateProcess(new ProcessCreateOptions
                 {

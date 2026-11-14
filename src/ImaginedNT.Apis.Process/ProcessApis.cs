@@ -1,6 +1,7 @@
 using static ImaginedNT.Apis.ApiHelpers;
 using System.Text;
 using ImaginedNT.Core.Diagnostics;
+using ImaginedNT.Core.Security;
 using ImaginedNT.Core.Io;
 using ImaginedNT.Core.Memory;
 using ImaginedNT.Core.Nt;
@@ -24,6 +25,22 @@ public static class ProcessApis
 
     [VirtualApi("kernel32.dll", "CreateProcessA", ApiCategory.Process)]
     private static ulong CreateProcessA(ApiCallContext ctx) => CreateProcessCore(ctx, unicode: false);
+
+    [VirtualApi("advapi32.dll", "CreateProcessAsUserW", ApiCategory.Security)]
+    [VirtualApi("advapi32.dll", "CreateProcessAsUserA", ApiCategory.Security)]
+    private static ulong CreateProcessAsUser(ApiCallContext ctx)
+    {
+        var status = ctx.Handles.TryGet(ctx.Arg(0), 0xB, out var obj);
+        if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
+        if (obj is not TokenObject token) return BoolResult(ctx, false, Win32Error.InvalidHandle);
+        if (token.Impersonation) return BoolResult(ctx, false, 1349);
+        if (token.Token.User.Sid != ctx.Process.Token.User.Sid && !ctx.Thread.EffectiveToken.IsSystem &&
+            !ctx.Thread.EffectiveToken.HasPrivilege("SeAssignPrimaryTokenPrivilege"))
+            return BoolResult(ctx, false, Win32Error.PrivilegeNotHeld);
+        var args = Enumerable.Range(1, 10).Select(ctx.Arg).ToArray();
+        return CreateProcessCore(new ApiCallContext(ctx.Process, ctx.Thread, ctx.Module, ctx.Name, ctx.ApiId,
+            ctx.ReturnAddress, args, ctx.ReturnAddressSlot), ctx.Name.EndsWith('W'), token.Token);
+    }
 
     /// <summary>Legacy WinExec: create a child and return an instance handle greater than 31.</summary>
     [VirtualApi("kernel32.dll", "WinExec", ApiCategory.Process)]
@@ -83,7 +100,7 @@ public static class ProcessApis
         }
     }
 
-    private static ulong CreateProcessCore(ApiCallContext ctx, bool unicode)
+    private static ulong CreateProcessCore(ApiCallContext ctx, bool unicode, AccessToken? token = null)
     {
         var processInformationPtr = ctx.Arg(9);
         if (processInformationPtr == 0)
@@ -125,7 +142,14 @@ public static class ProcessApis
                 unicode && (creationFlags & CreateUnicodeEnvironment) != 0);
             var suspended = (creationFlags & CreateSuspended) != 0;
 
-            var imagePath = ResolveExecutablePath(ctx, application, commandLine);
+            string? imagePath;
+            var previousToken = ctx.Thread.ImpersonationToken;
+            try
+            {
+                if (token is not null) ctx.Thread.ImpersonationToken = token;
+                imagePath = ResolveExecutablePath(ctx, application, commandLine);
+            }
+            finally { ctx.Thread.ImpersonationToken = previousToken; }
             if (imagePath is null)
             {
                 ctx.SetLastError(Win32Error.FileNotFound);
@@ -142,6 +166,7 @@ public static class ProcessApis
                 SandboxRoot = ctx.Process.FileSystem.Root,
                 ParentId = ctx.Process.Id,
                 IsRoot = false,
+                Token = token,
                 Desktop = ReadStartupDesktop(ctx, ctx.Arg(8), unicode),
                 Environment = environment
             });
@@ -302,8 +327,8 @@ public static class ProcessApis
         var candidates = new List<string>();
         try
         {
-            var mapped = ctx.Process.FileSystem.MapPath(token, ctx.Process.CurrentDirectory);
-            AddExecutableCandidates(candidates, mapped);
+            if (ctx.Process.FileSystem.TryMapPath(token, ctx.Process.CurrentDirectory, FileOperation.Read, out var mapped) == NtStatus.Success)
+                AddExecutableCandidates(candidates, mapped);
         }
         catch (NtFileException)
         {
@@ -325,8 +350,8 @@ public static class ProcessApis
                 {
                     try
                     {
-                        var mapped = ctx.Process.FileSystem.MapPath(directory, ctx.Process.CurrentDirectory);
-                        AddExecutableCandidates(candidates, Path.Combine(mapped, token));
+                        if (ctx.Process.FileSystem.TryMapPath(directory, ctx.Process.CurrentDirectory, FileOperation.Read, out var mapped) == NtStatus.Success)
+                            AddExecutableCandidates(candidates, Path.Combine(mapped, token));
                     }
                     catch (NtFileException)
                     {

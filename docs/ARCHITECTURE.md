@@ -600,18 +600,19 @@ apply it in `PeLoader` before protections are set. Section protections must be a
 ## 14. GUI window personality (App layer)
 
 The window manager is deliberately **not** part of `ImaginedNT.Apis`.  It needs a compositor, a
-virtual screen and a UI thread, so it lives in the UWP App project:
-`src/ImaginedNT.App/Gui` owns the USER32/DWM registrations and `src/ImaginedNT.App/Controls`
-owns the XAML compositor.
+virtual screen and a UI thread. Both UI hosts use the shared class library:
+`src/ImaginedNT.AppShared/Gui` owns the USER32/DWM registrations and `src/ImaginedNT.App/Controls`
+owns the UWP XAML compositor; `src/ImaginedNT.FullTrustApp/Controls` owns the WinUI compositor.
 
 ```
-ImaginedNT.App
+ImaginedNT.AppShared
   Gui/WindowManager       classes, geometry, z-order, focus, colours, timers
     ThreadMessageQueue    one queue per guest thread; WaitForMessage/Post
   Gui/WindowApis          [VirtualApi] USER32 shims
   Gui/DwmApis             [VirtualApi] DWM shims
   Gui/GuiLibrary          runtime -> manager attachment (ConditionalWeakTable)
-  Gui/GuiSession          own ImaginedRuntime + built-in API set + App assembly
+ImaginedNT.App
+  Gui/GuiSession          own ImaginedRuntime + built-in API set + AppShared assembly
   Controls/DwmCompositor  XAML surfaces + pointer/keyboard forwarding
 ```
 

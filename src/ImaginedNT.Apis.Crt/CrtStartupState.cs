@@ -207,7 +207,11 @@ internal sealed partial class CrtProcessState
             }
             try
             {
-                var path = ctx.Process.FileSystem.MapPath(argument, ctx.Process.CurrentDirectory);
+                if (ctx.Process.FileSystem.TryMapPath(argument, ctx.Process.CurrentDirectory, FileOperation.Read, out var path) != NtStatus.Success)
+                {
+                    result.Add(argument);
+                    continue;
+                }
                 var matches = HostFileSystem.GetFileSystemEntries(Path.GetDirectoryName(path)!, Path.GetFileName(path));
                 if (matches.Length != 0)
                 {

@@ -58,10 +58,11 @@ public sealed class ImaginedProcess : IDisposable
 
     internal ImaginedProcess(ImaginedRuntime runtime, int id, string imagePath, string commandLine, string currentDirectory,
         int? parentId, string sandboxRoot, IReadOnlyDictionary<string, string> environment, bool isRoot, SessionInformation session,
-        DesktopObject desktop, Func<ImaginedProcessContext, CancellationToken, Task<int>>? entryPoint = null)
+        DesktopObject desktop, Security.AccessToken token, Func<ImaginedProcessContext, CancellationToken, Task<int>>? entryPoint = null)
     {
         _entryPoint = entryPoint;
         Runtime = runtime;
+        Token = token;
         Id = id;
         SessionId = session.Id;
         StartupDesktop = desktop;
@@ -86,8 +87,9 @@ public sealed class ImaginedProcess : IDisposable
         Heap = new GuestHeap(Trace, id, memory: runtime.Memory);
         _heaps.Add(Heap);
         ObjectManager = runtime.Objects;
-        Handles = new HandleTable(Trace, id);
-        FileSystem = new SandboxFileSystem(sandboxRoot, _options.AllowFileWrites, Trace, id, _options.Drives);
+        Handles = new HandleTable(Trace, id) { TokenProvider = () => EffectiveToken };
+        FileSystem = new SandboxFileSystem(sandboxRoot, _options.AllowFileWrites, Trace, id, _options.Drives,
+            () => EffectiveToken);
         foreach (var drive in FileSystem.Drives)
         {
             ObjectManager.EnsureDirectory(drive.DevicePath);
@@ -106,6 +108,8 @@ public sealed class ImaginedProcess : IDisposable
         }
 
         foreach (var pair in environment) _environment[pair.Key] = pair.Value;
+        _environment["USERNAME"] = Token.User.Name;
+        _environment["USERPROFILE"] = Token.IsSystem ? @"C:\Windows\System32\config\systemprofile" : $@"C:\Users\{Token.User.Name}";
 
         InitializeStandardHandles();
         Trace.Emit(TraceKind.Process,
@@ -113,6 +117,8 @@ public sealed class ImaginedProcess : IDisposable
     }
 
     public ImaginedRuntime Runtime { get; }
+    public Security.AccessToken Token { get; }
+    public Security.AccessToken EffectiveToken => Runtime.GetCurrentThread() is { } t && t.Process == this ? t.EffectiveToken : Token;
     public PackageIdentity? PackageIdentity { get; }
     public int Id { get; }
     public uint SessionId { get; }
@@ -143,8 +149,15 @@ public sealed class ImaginedProcess : IDisposable
 
     public GuestHeap? FindHeap(ulong handle)
     {
-        lock (_heapGate) return _heaps.FirstOrDefault(h => h.MatchesHandle(handle));
+        return GetHeaps().FirstOrDefault(h => h.MatchesHandle(handle));
     }
+
+    public GuestHeap[] GetHeaps()
+    {
+        lock (_heapGate) return _heaps.ToArray();
+    }
+
+    public GuestHeap? FindHeapContaining(ulong address) => GetHeaps().FirstOrDefault(h => h.Contains(address));
 
     /// <summary>Allocate a Win32 TLS index; -1 means TLS_OUT_OF_INDEXES.</summary>
     public int AllocateTlsSlot()
@@ -174,12 +187,12 @@ public sealed class ImaginedProcess : IDisposable
         }
     }
 
-    public ulong CreateHeap(uint options, ulong initialSize, ulong maximumSize, int threadId)
+    public ulong CreateHeap(uint options, ulong initialSize, ulong maximumSize, int threadId, ulong reserveSize = 0)
     {
         GuestHeap? heap = null;
         try
         {
-            heap = new GuestHeap(Trace, Id, options, initialSize, maximumSize, Runtime.Memory);
+            heap = new GuestHeap(Trace, Id, options, initialSize, maximumSize, Runtime.Memory, reserveSize);
             var handle = heap.GetHandle(threadId);
             lock (_heapGate)
             {
@@ -202,6 +215,7 @@ public sealed class ImaginedProcess : IDisposable
 
     public bool DestroyHeap(ulong handle)
     {
+        lock (Runtime.Memory.Gate)
         lock (_heapGate)
         {
             var heap = _heaps.FirstOrDefault(h => h.MatchesHandle(handle));
@@ -356,7 +370,12 @@ public sealed class ImaginedProcess : IDisposable
             return HostFileSystem.FileExists(name) ? name : throw new FileNotFoundException($"redirected DLL not found: '{name}'", name);
         if (Runtime.FindImportedLibrary(name) is { } imported) return imported;
         var candidates = new List<string>();
-        try { _ = FileSystem.MapPath(name, CurrentDirectory, FileOperation.Execute); candidates.Add(FileSystem.MapPath(name, CurrentDirectory)); }
+        try
+        {
+            if (FileSystem.TryMapPath(name, CurrentDirectory, FileOperation.Execute, out _) == NtStatus.Success &&
+                FileSystem.TryMapPath(name, CurrentDirectory, FileOperation.Read, out var host) == NtStatus.Success)
+                candidates.Add(host);
+        }
         catch (NtFileException) { }
         if (!Path.IsPathRooted(name))
         {
@@ -366,9 +385,10 @@ public sealed class ImaginedProcess : IDisposable
         if (includeSystem) candidates.Add(Path.Combine(Environment.SystemDirectory, Path.GetFileName(name)));
         foreach (var path in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            if (HostFileSystem.FileExists(path)) return FileSystem.MapImagePath(path);
+            if (HostFileSystem.FileExists(path))
+                return FileSystem.TryMapImagePath(path, out var mapped) == NtStatus.Success ? mapped : null;
             if (!path.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) && HostFileSystem.FileExists(path + ".dll"))
-                return FileSystem.MapImagePath(path + ".dll");
+                return FileSystem.TryMapImagePath(path + ".dll", out var mappedDll) == NtStatus.Success ? mappedDll : null;
         }
         return null;
     }
@@ -443,7 +463,10 @@ public sealed class ImaginedProcess : IDisposable
 
     public void SetEnvironmentVariable(string name, string? value, EnvironmentVariableTarget target)
     {
-        if (string.IsNullOrEmpty(name) || name.Contains('=') || name.Contains('\0') || name.Length > 32766 ||
+        // cmd 使用以 = 开头的隐藏变量保存盘符目录和退出码。
+        var hidden = target == EnvironmentVariableTarget.Process && name is { Length: > 1 } &&
+            name[0] == '=' && name.IndexOf('=', 1) < 0;
+        if (string.IsNullOrEmpty(name) || (!hidden && name.Contains('=')) || name.Contains('\0') || name.Length > 32766 ||
             value is { Length: > 32766 } || value?.Contains('\0') == true)
             throw new ArgumentException($"Invalid environment variable name or value. Try to set name {EscapeForErrorMessage(name)} and value {EscapeForErrorMessage(value)}");
         if (target == EnvironmentVariableTarget.Process)
@@ -455,7 +478,9 @@ public sealed class ImaginedProcess : IDisposable
         if (target is not (EnvironmentVariableTarget.User or EnvironmentVariableTarget.Machine))
             throw new ArgumentOutOfRangeException(nameof(target));
         if (!FileSystem.AllowWrites) throw new UnauthorizedAccessException("Registry writes are disabled");
-        try { RegistryStore.Get(Runtime, FileSystem.Root).SetEnvironment(name, value, target); }
+        if (target == EnvironmentVariableTarget.Machine && !EffectiveToken.IsSystem && EffectiveToken.Match("Administrators") < 0)
+            throw new UnauthorizedAccessException("machine environment requires an administrator");
+        try { RegistryStore.Get(Runtime, FileSystem.Root).SetEnvironment(name, value, target, EffectiveToken.User.Sid); }
         catch (Exception ex)
         {
             Trace.Error($"could not persist virtual environment variable '{name}': {ex}", Id);
@@ -469,7 +494,7 @@ public sealed class ImaginedProcess : IDisposable
 
     public IReadOnlyDictionary<string, string> GetEnvironmentVariables(EnvironmentVariableTarget target = EnvironmentVariableTarget.Process) =>
         target == EnvironmentVariableTarget.Process ? new Dictionary<string, string>(_environment, StringComparer.OrdinalIgnoreCase)
-            : RegistryStore.Get(Runtime, FileSystem.Root).ReadEnvironment(target)
+            : RegistryStore.Get(Runtime, FileSystem.Root).ReadEnvironment(target, EffectiveToken.User.Sid)
                 .ToDictionary(p => p.Key, p => p.Value.Value, StringComparer.OrdinalIgnoreCase);
 
     public string ExpandEnvironmentVariables(string value) => VirtualEnvironment.Expand(value, _environment);
@@ -1081,6 +1106,7 @@ public sealed class ImaginedProcess : IDisposable
         _failFastInterceptors.Clear();
         try { Handles.Dispose(); } catch { }
         // The runtime owns the shared object namespace.
+        lock (Runtime.Memory.Gate)
         lock (_heapGate)
         {
             foreach (var heap in _heaps) heap.Dispose();

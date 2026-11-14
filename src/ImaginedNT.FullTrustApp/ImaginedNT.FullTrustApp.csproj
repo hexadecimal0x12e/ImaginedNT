@@ -19,6 +19,9 @@
 		<CETCompat>false</CETCompat>
     <Publisher>hexadecimal0x12e</Publisher>
 	</PropertyGroup>
+  <ItemGroup>
+    <None Remove="MockWindows\VirtualWindowsSession.xaml" />
+  </ItemGroup>
 
   <ItemGroup>
     <Content Include="Assets\SplashScreen.scale-200.png" />
@@ -82,19 +85,23 @@
   </PropertyGroup>
 
 	<ItemGroup>
-		<ProjectReference Include="..\ImaginedNT.Apis\ImaginedNT.Apis.csproj" />
+		<ProjectReference Include="..\ImaginedNT.AppShared\ImaginedNT.AppShared.csproj" />
 		<Content Include="..\..\samples\bin\gdi.exe" Condition="Exists('..\..\samples\bin\gdi.exe')">
 			<Link>gdi.exe</Link>
 			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
 			<CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
 		</Content>
-		<Compile Include="..\ImaginedNT.App\Gui\*.cs" Exclude="..\ImaginedNT.App\Gui\GuiSession.cs" Link="Gui\%(Filename)%(Extension)" />
-		<Compile Include="..\ImaginedNT.App\ShellSession.cs" Link="Hosting\ShellSession.cs" />
-    <Compile Include="..\ImaginedNT.App\Settings\*.cs" Link="Settings\%(Filename)%(Extension)" />
+    <Compile Include="..\ImaginedNT.AppShared\Views\RuntimeSettingsView.cs" Link="Settings\RuntimeSettingsView.cs" />
     <Content Include="ConsoleHost\bin\conhost.exe">
       <Link>conhost.exe</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
     </Content>
+	</ItemGroup>
+
+	<ItemGroup>
+	  <Page Update="MockWindows\VirtualWindowsSession.xaml">
+	    <Generator>MSBuild:Compile</Generator>
+	  </Page>
 	</ItemGroup>
 </Project>

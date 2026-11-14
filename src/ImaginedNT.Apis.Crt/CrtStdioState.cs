@@ -268,12 +268,7 @@ internal sealed partial class CrtStdioState : IDisposable
                 UnauthorizedAccessException => 13,
                 OutOfMemoryException => 12,
                 FileNotFoundException or DirectoryNotFoundException => 2,
-                NtFileException file => file.Status switch
-                {
-                    NtStatus.AccessDenied or NtStatus.SharingViolation => 13,
-                    NtStatus.ObjectNameNotFound or NtStatus.ObjectPathNotFound => 2,
-                    _ => 22
-                },
+                NtFileException file => FileErrno(file.Status),
                 IOException => 5,
                 _ => 22
             });
@@ -285,6 +280,13 @@ internal sealed partial class CrtStdioState : IDisposable
             Native.SetInvalidHandler(previous);
         }
     }
+
+    private static int FileErrno(uint status) => status switch
+    {
+        NtStatus.AccessDenied or NtStatus.SharingViolation => 13,
+        NtStatus.ObjectNameNotFound or NtStatus.ObjectPathNotFound => 2,
+        _ => 22
+    };
 
     private ulong Dispatch(ApiCallContext ctx, string name)
     {

@@ -35,6 +35,7 @@ public abstract class NtObject : IDisposable
     public string? Name { get; internal set; }
     public string? FullPath { get; internal set; }
     public DateTimeOffset CreatedAt { get; } = DateTimeOffset.UtcNow;
+    public Security.ResourceSecurity? Security { get; set; }
     public virtual bool SupportsWait => false;
     public virtual bool IsSignaled => false;
     public virtual string? Info => null;

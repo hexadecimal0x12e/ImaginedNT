@@ -22,7 +22,8 @@
     <LayoutDir></LayoutDir>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\ImaginedNT.Apis\ImaginedNT.Apis.csproj" />
+    <ProjectReference Include="..\ImaginedNT.AppShared\ImaginedNT.AppShared.csproj" />
+    <Compile Include="..\ImaginedNT.AppShared\Views\RuntimeSettingsView.cs" Link="Settings\RuntimeSettingsView.cs" />
     <Content Include="..\..\samples\bin\shell.exe">
 			<Link>shell.exec</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

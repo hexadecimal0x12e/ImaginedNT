@@ -1,10 +1,10 @@
 using System.Runtime.CompilerServices;
 using ImaginedNT.Core.Runtime;
 
-namespace ImaginedNT.App.Gui;
+namespace ImaginedNT.AppShared.Gui;
 
 /// <summary>
-/// Associates an <see cref="ImaginedRuntime"/> with the App-side window manager.  The virtual
+/// Associates an <see cref="ImaginedRuntime"/> with the shared window manager. The virtual
 /// USER32/DWM APIs live in this assembly; embedding hosts opt in by registering
 /// <see cref="WindowApis"/> and attaching a manager before running a guest.
 /// </summary>

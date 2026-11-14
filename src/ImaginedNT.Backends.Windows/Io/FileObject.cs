@@ -25,6 +25,7 @@ public sealed class DiskFileObject : FileObject
     public override long Length => _stream.Length;
     public override bool CanRead => _stream.CanRead;
     public override bool CanWrite => _stream.CanWrite;
+    public override bool CanSeek => _stream.CanSeek;
     public override nint GetNativeHandle()
     {
         _stream.Flush();

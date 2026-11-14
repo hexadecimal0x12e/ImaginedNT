@@ -1,6 +1,6 @@
 using ImaginedNT.Core.Runtime;
 
-namespace ImaginedNT.App.Gui;
+namespace ImaginedNT.AppShared.Gui;
 
 /// <summary>
 /// Minimal DWM surface.  The App compositor always reports composition as enabled and accepts

@@ -1,4 +1,4 @@
-using ImaginedNT.App.Settings;
+using ImaginedNT.AppShared.Views;
 using ImaginedNT.FullTrustApp.Hosting;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;

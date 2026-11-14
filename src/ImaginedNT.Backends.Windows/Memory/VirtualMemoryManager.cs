@@ -147,7 +147,23 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
         actualBase = actualSize = 0;
         if (size == 0 || size > ulong.MaxValue - AllocationGranularity || requestedBase > ulong.MaxValue - size - PageSize)
             return NtStatus.InvalidParameter;
-        if ((type & ~(AllocationType.Reserve | AllocationType.Commit | AllocationType.TopDown)) != 0 ||
+        if (type is AllocationType.Reset || (uint)type == 0x1000000)
+        {
+            var resetStart = requestedBase & ~(PageSize - 1);
+            var resetLength = PageAlign(size + requestedBase - resetStart);
+            lock (_memory.Gate)
+            lock (_gate)
+            {
+                var owner = _ownedAllocations.FirstOrDefault(a => requestedBase >= a.Key && requestedBase - a.Key < a.Value);
+                if (owner.Value == 0 || resetLength > owner.Value - (resetStart - owner.Key)) return NtStatus.InvalidAddress;
+                var reset = Native.NativeMethods.VirtualAlloc((nint)resetStart, (nuint)resetLength, (uint)type, (uint)protection);
+                if (reset == 0) return NtStatus.FromWin32(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
+                actualBase = (ulong)reset;
+                actualSize = resetLength;
+                return NtStatus.Success;
+            }
+        }
+        if ((type & ~(AllocationType.Reserve | AllocationType.Commit | AllocationType.TopDown | AllocationType.WriteWatch)) != 0 ||
             (type & (AllocationType.Reserve | AllocationType.Commit)) == 0) return NtStatus.InvalidParameter;
         if (requestedBase == 0) type |= AllocationType.Reserve;
         var start = requestedBase & ~((type.HasFlag(AllocationType.Reserve) ? AllocationGranularity : PageSize) - 1);
@@ -175,7 +191,8 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
                 BaseAddress = actualBase, RegionSize = length,
                 AllocationBase = type.HasFlag(AllocationType.Reserve) ? actualBase : owner.Key,
                 AllocationSize = type.HasFlag(AllocationType.Reserve) ? length : owner.Value,
-                Protection = protection, State = type.HasFlag(AllocationType.Commit) ? MemoryState.Commit : MemoryState.Reserve,
+                Protection = type.HasFlag(AllocationType.Commit) ? protection : MemoryProtection.NoAccess,
+                State = type.HasFlag(AllocationType.Commit) ? MemoryState.Commit : MemoryState.Reserve,
                 Type = previous?.Type ?? MemoryType.Private, Label = label ?? previous?.Label
             });
             _memory.UpdateUsage(_pid, 0, 0, commit, type.HasFlag(AllocationType.Reserve) ? length : 0);
@@ -204,12 +221,13 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
         lock (_memory.Gate)
         lock (_gate)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             var region = FindRegion(baseAddress);
             if (!Native.NativeMethods.VirtualProtect((IntPtr)(long)baseAddress, (UIntPtr)size, (uint)protection, out var old))
                 return NtStatus.FromWin32(System.Runtime.InteropServices.Marshal.GetLastWin32Error());
 
             oldProtection = (MemoryProtection)Native.NativeMethods.ToNtProtection(old);
-            AddRegion(new MemoryRegion
+            if (region is not null) AddRegion(new MemoryRegion
             {
                 BaseAddress = baseAddress & ~(PageSize - 1),
                 RegionSize = PageAlign(baseAddress + size) - (baseAddress & ~(PageSize - 1)),
@@ -324,8 +342,15 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
     }
 
     public bool IsReadable(ulong address, ulong length)
+        => CanAccess(address, length, false);
+
+    public bool IsWritable(ulong address, ulong length)
+        => CanAccess(address, length, true);
+
+    private bool CanAccess(ulong address, ulong length, bool write)
     {
-        if (address == 0 || length == 0) return false;
+        if (length == 0) return true;
+        if (address == 0 || address > long.MaxValue || length > (ulong)long.MaxValue - address) return false;
         var current = address;
         var remaining = length;
         while (remaining > 0)
@@ -334,6 +359,10 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
                 return false;
             if (info.State != Native.NativeMethods.MEM_COMMIT) return false;
             if ((info.Protect & Native.NativeMethods.PAGE_NOACCESS) != 0 || (info.Protect & Native.NativeMethods.PAGE_GUARD) != 0) return false;
+            var protection = (MemoryProtection)(info.Protect & 0xFF);
+            if (write && protection is not (MemoryProtection.ReadWrite or MemoryProtection.WriteCopy or
+                MemoryProtection.ExecuteReadWrite or MemoryProtection.ExecuteWriteCopy)) return false;
+            if (!write && protection == MemoryProtection.Execute) return false;
             var regionEnd = (ulong)(long)info.BaseAddress + (ulong)info.RegionSize;
             var span = Math.Min(remaining, regionEnd - current);
             if (span == 0 || regionEnd <= current) return false;
@@ -345,7 +374,8 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
 
     public bool TryRead(ulong address, Span<byte> destination)
     {
-        if (address == 0 || destination.Length == 0) return false;
+        if (destination.Length == 0) return true;
+        if (address == 0 || address > long.MaxValue || (ulong)destination.Length > (ulong)long.MaxValue - address) return false;
         fixed (byte* buffer = destination)
         {
             return Native.NativeMethods.ReadProcessMemory(Native.NativeMethods.GetCurrentProcess(),
@@ -372,7 +402,8 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
 
     public bool TryWrite(ulong address, ReadOnlySpan<byte> source)
     {
-        if (address == 0 || source.Length == 0) return false;
+        if (source.Length == 0) return true;
+        if (address == 0 || address > long.MaxValue || (ulong)source.Length > (ulong)long.MaxValue - address) return false;
         fixed (byte* buffer = source)
         {
             return Native.NativeMethods.WriteProcessMemory(Native.NativeMethods.GetCurrentProcess(),
@@ -423,7 +454,7 @@ public sealed unsafe class VirtualMemoryManager : IDisposable
         var offset = 0UL;
         while (i < maxChars)
         {
-            var count = Math.Min(buffer.Length, maxChars - i);
+            var count = (int)Math.Min((ulong)Math.Min(buffer.Length, maxChars - i), PageSize - ((address + offset) & (PageSize - 1)));
             if (!TryRead(address + offset, buffer.AsSpan(0, count)))
                 throw new NtMemoryException(NtStatus.AccessViolation, $"unreadable ANSI string at 0x{address:X16}");
             for (var j = 0; j < count; j++)

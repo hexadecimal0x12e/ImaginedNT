@@ -9,30 +9,39 @@ HostRoot: C:\
 Initials:
   -<not_allow>: -read,-enum,-write,-execute,-delete
 FS:
-  -<self>: +read,+enum,+write
-  -shell.exe: +read:remap_host@"c:\windows\system32\cmd.exe",+execute
-  -Windows:
-    -<self>: +read,+enum,-write,-execute,-delete
-    -system32:
-      -*.exe: +execute
-      -config: -read,-enum,-write
-      -test: <not_allow>
-    -*.exe: +execute
-    -explorer.exe: -execute
-    -**\*.dll: +execute,+enum
-    -<left>: -read,-write,-execute
-  -New Folder 1: +write
-  -New Folder 2: <default>
-  -Any access: -<not_allow>
-  -Read only: <not_allow>,+read
-  -Discarded_Write: +read,+write:discard
-  -Remapped_Write_On_Host: +read,+write:remap_host@"c:\mapped_path",-delete
-  -Remapped_Write_On_Virt: +read,+write:remap_virt@"\Discarded_Write"
-  -Remapped_Read_On_Host: +read:remap_host@"d:\another_path"
-  -Remapped_Read_On_Virt: +read:remap_virt@"\windows\system32"
-  -Both_Remap_Read_and_Write: +read:remap_host@"d:\another_path",+write:remap_virt@"\New Folder 1"
-  -Visibility_Overrides:
-    -<self>: +read,+enum
-    -*: exclude
-    -Visible: -exclude
-    -Hidden: +exclude
+  '*@Private':
+    '*@<self>': -read,-write,-enum,-execute,-delete
+    'Alice@<self>': +read,+write,+enum,+delete
+    'Administrators@<self>': +read,+enum
+  '*@Shared':
+    '*@<self>': -read,-write,-enum,-execute,-delete
+    'Users@<self>': +read,+enum
+    'Developers@<self>': +write
+    'S-1-5-18@<self>': +read,+write,+enum,+delete
+  '*@<self>': +read,+enum,+write
+  '*@shell.exe': +read:remap_host@"c:\windows\system32\cmd.exe",+execute
+  '*@Windows':
+    '*@<self>': +read,+enum,-write,-execute,-delete
+    '*@system32':
+      '*@*.exe': +execute
+      '*@config': -read,-enum,-write
+      '*@test': <not_allow>
+    '*@*.exe': +execute
+    '*@explorer.exe': -execute
+    '*@**\*.dll': +execute,+enum
+    '*@<left>': -read,-write,-execute
+  '*@New Folder 1': +write
+  '*@New Folder 2': <default>
+  '*@Any access': -<not_allow>
+  '*@Read only': <not_allow>,+read
+  '*@Discarded_Write': +read,+write:discard
+  '*@Remapped_Write_On_Host': +read,+write:remap_host@"c:\mapped_path",-delete
+  '*@Remapped_Write_On_Virt': +read,+write:remap_virt@"\Discarded_Write"
+  '*@Remapped_Read_On_Host': +read:remap_host@"d:\another_path"
+  '*@Remapped_Read_On_Virt': +read:remap_virt@"\windows\system32"
+  '*@Both_Remap_Read_and_Write': +read:remap_host@"d:\another_path",+write:remap_virt@"\New Folder 1"
+  '*@Visibility_Overrides':
+    '*@<self>': +read,+enum
+    '*@*': exclude
+    '*@Visible': -exclude
+    '*@Hidden': +exclude

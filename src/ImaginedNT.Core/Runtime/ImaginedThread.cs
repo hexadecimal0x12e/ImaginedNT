@@ -81,6 +81,8 @@ public sealed class ImaginedThread : IDisposable
     }
 
     public ImaginedProcess Process { get; }
+    public Security.AccessToken? ImpersonationToken { get; set; }
+    public Security.AccessToken EffectiveToken => ImpersonationToken ?? Process.Token;
     private DesktopObject? _desktop;
     public DesktopObject Desktop { get => _desktop ?? Process.StartupDesktop; internal set => _desktop = value; }
     public ulong DesktopHandle { get; internal set; }
@@ -197,7 +199,16 @@ public sealed class ImaginedThread : IDisposable
             // before the caller releases the process address space.
             try
             {
-                if (!_managedThread.Join(timeout)) return false;
+                var infinite = timeout == Timeout.InfiniteTimeSpan;
+                var started = Environment.TickCount64;
+                while (true)
+                {
+                    // 终止请求可能早于同步 I/O 开始，等待期间需再次取消。
+                    if (TerminationRequested) CancelPendingIo();
+                    var remaining = infinite ? 50 : Math.Max(0, timeout.TotalMilliseconds - (Environment.TickCount64 - started));
+                    if (_managedThread.Join(TimeSpan.FromMilliseconds(Math.Min(remaining, 50)))) break;
+                    if (!infinite && Environment.TickCount64 - started >= timeout.TotalMilliseconds) return false;
+                }
             }
             catch (ThreadStateException)
             {
@@ -280,6 +291,14 @@ public sealed class ImaginedThread : IDisposable
         Interlocked.Exchange(ref _terminationExitCode, exitCode);
         Volatile.Write(ref _terminationRequested, 1);
         if (!HasStarted) MarkExited(exitCode, ThreadState.Terminated);
+        else CancelPendingIo();
+    }
+
+    private void CancelPendingIo()
+    {
+        if (!_managedHosted || IsImaginedEntry) return;
+        lock (_gate)
+            if (_handle != IntPtr.Zero) NativeMethods.CancelSynchronousIo(_handle);
     }
 
     public void Dispose()
@@ -344,6 +363,8 @@ public sealed class ImaginedThread : IDisposable
     {
         var nativeId = NativeMethods.GetCurrentThreadId();
         Process.AttachThread(this, nativeId);
+        // Thread.Start 会继承启动者的 AsyncLocal；PE 线程也必须绑定自己的身份。
+        Process.Runtime.SetImaginedThread(this);
         var handle = NativeMethods.OpenThread(NativeMethods.THREAD_ALL_ACCESS, false, nativeId);
         if (handle != IntPtr.Zero)
         {
@@ -358,7 +379,6 @@ public sealed class ImaginedThread : IDisposable
         {
             if (_entryPoint is not null)
             {
-                Process.Runtime.SetImaginedThread(this);
                 var exitCode = _entryPoint(new ImaginedProcessContext(this), _cancellation!.Token).GetAwaiter().GetResult();
                 Complete(exitCode, ThreadState.Exited);
                 return;
@@ -394,7 +414,7 @@ public sealed class ImaginedThread : IDisposable
         }
         finally
         {
-            if (IsImaginedEntry) Process.Runtime.SetImaginedThread(null);
+            Process.Runtime.SetImaginedThread(null);
             Process.DetachThread(this);
             if (IsImaginedEntry && Process.DisposalRequested)
                 ThreadPool.QueueUserWorkItem(state =>

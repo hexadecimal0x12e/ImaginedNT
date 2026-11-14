@@ -5,9 +5,9 @@ using ImaginedNT.Core.Diagnostics;
 using ImaginedNT.Core.Io;
 using ImaginedNT.Core.Runtime;
 
-namespace ImaginedNT.App.Settings;
+namespace ImaginedNT.AppShared.Settings;
 
-internal sealed class RuntimeSettings(string path, TraceLog log, Func<RuntimeOptions>? defaults = null)
+public sealed class RuntimeSettings(string path, TraceLog log, Func<RuntimeOptions>? defaults = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
     {

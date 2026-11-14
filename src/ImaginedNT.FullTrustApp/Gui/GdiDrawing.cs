@@ -1,5 +1,5 @@
 using System.ComponentModel;
-using ImaginedNT.App.Gui;
+using ImaginedNT.AppShared.Gui;
 using ImaginedNT.Core.Runtime;
 
 namespace ImaginedNT.FullTrustApp.Gui;

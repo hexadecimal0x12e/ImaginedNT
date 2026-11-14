@@ -1,9 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using ImaginedNT.App.Gui;
+using ImaginedNT.AppShared.Gui;
 using Windows.Foundation;
-using Windows.System;
 using Windows.UI;
 using Windows.UI.Text;
 using Windows.UI.Xaml;
@@ -475,40 +474,14 @@ public sealed partial class DwmCompositor : UserControl
 
     private void OnKeyDown(object sender, KeyRoutedEventArgs args)
     {
-        var manager = _manager;
-        if (manager is null) return;
-        var key = (int)args.Key;
-        if (key is <= 0 or > 255) return;
-        if (!manager.KeyDown(key, args.KeyStatus.ScanCode, args.KeyStatus.IsExtendedKey, args.KeyStatus.WasKeyDown)) return;
-        var character = args.Key switch
-        {
-            VirtualKey.Enter => '\r',
-            VirtualKey.Back => '\b',
-            VirtualKey.Tab => '\t',
-            _ => '\0'
-        };
-        if (character != '\0')
-        {
-            manager.Character(character);
-            args.Handled = true;
-        }
-        else
-        {
-            // Handling printable keys here suppresses the following CharacterReceived event.
-            args.Handled = args.Key is VirtualKey.Escape or VirtualKey.Left or VirtualKey.Right or
-                VirtualKey.Up or VirtualKey.Down or VirtualKey.Home or VirtualKey.End or
-                VirtualKey.PageUp or VirtualKey.PageDown or VirtualKey.Insert or VirtualKey.Delete ||
-                key >= (int)VirtualKey.F1 && key <= (int)VirtualKey.F24;
-        }
+        if (CompositorInput.KeyDown(_manager, (int)args.Key, args.KeyStatus.ScanCode,
+            args.KeyStatus.IsExtendedKey, args.KeyStatus.WasKeyDown) is bool handled)
+            args.Handled = handled;
     }
 
     private void OnKeyUp(object sender, KeyRoutedEventArgs args)
     {
-        var manager = _manager;
-        if (manager is null) return;
-        var key = (int)args.Key;
-        if (key is <= 0 or > 255) return;
-        if (manager.KeyUp(key, args.KeyStatus.ScanCode, args.KeyStatus.IsExtendedKey))
+        if (CompositorInput.KeyUp(_manager, (int)args.Key, args.KeyStatus.ScanCode, args.KeyStatus.IsExtendedKey))
             args.Handled = true;
     }
 

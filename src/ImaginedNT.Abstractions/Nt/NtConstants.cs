@@ -90,7 +90,7 @@ public static class NtAccess
     public const uint EventQueryState = 0x0001;
     public const uint EventModifyState = 0x0002;
     public const uint MutantQueryState = 0x0001;
-    public const uint MutantModifyState = 0x0002;
+    public const uint MutantModifyState = 0x0001;
     public const uint SemaphoreQueryState = 0x0001;
     public const uint SemaphoreModifyState = 0x0002;
 
@@ -159,6 +159,7 @@ public enum CreateOptions : uint
     CompleteIfOplocked = 0x0000_0100,
     OpenForRecovery = 0x0000_0200,
     NoEaKnowledge = 0x0000_0400,
+    DeleteOnClose = 0x0000_1000,
     OpenNoRecall = 0x0000_1000,
     OpenForFreeSpaceQuery = 0x0000_2000,
     OpenReparsePoint = 0x0020_0000,

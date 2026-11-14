@@ -1,5 +1,6 @@
 using ImaginedNT.App.Gui;
-using ImaginedNT.App.Settings;
+using ImaginedNT.AppShared.Settings;
+using ImaginedNT.AppShared.Views;
 using ImaginedNT.Core.Io;
 using System.Text;
 using ImaginedNT.Core.Diagnostics;

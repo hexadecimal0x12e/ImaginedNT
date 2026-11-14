@@ -1,6 +1,6 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
-using ImaginedNT.App.Gui;
+using ImaginedNT.AppShared.Gui;
 
 namespace ImaginedNT.FullTrustApp.Gui;
 

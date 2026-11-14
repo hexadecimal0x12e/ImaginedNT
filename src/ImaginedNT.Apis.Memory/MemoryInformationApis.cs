@@ -10,7 +10,7 @@ public static class MemoryInformationApis
     [VirtualApi("kernel32.dll", "GlobalMemoryStatusEx", ApiCategory.Memory, "kernelbase!GlobalMemoryStatusEx")]
     private static ulong GlobalMemoryStatusEx(ApiCallContext ctx)
     {
-        if (ctx.Arg(0) == 0 || ctx.Read<uint>(ctx.Arg(0)) != 64)
+        if (ctx.Arg(0) == 0 || !ctx.Memory.IsWritable(ctx.Arg(0), 64) || ctx.Read<uint>(ctx.Arg(0)) != 64)
             return BoolResult(ctx, false, Win32Error.InvalidParameter);
         ctx.Memory.Write(ctx.Arg(0), ctx.Runtime.Memory.GetSnapshot().Available);
         return 1;
@@ -19,7 +19,7 @@ public static class MemoryInformationApis
     [VirtualApi("kernel32.dll", "GlobalMemoryStatus", ApiCategory.Memory, "kernelbase!GlobalMemoryStatus")]
     private static ulong GlobalMemoryStatus(ApiCallContext ctx)
     {
-        if (ctx.Arg(0) == 0) return 0;
+        if (ctx.Arg(0) == 0 || !ctx.Memory.IsWritable(ctx.Arg(0), 56)) return 0;
         var s = ctx.Runtime.Memory.GetSnapshot().Available;
         // MEMORYSTATUS uses SIZE_T fields on AMD64, unlike MEMORYSTATUSEX's DWORDLONG fields.
         s.Length = 56;
@@ -41,7 +41,8 @@ public static class MemoryInformationApis
     {
         var process = GetProcessInformation(ctx, ctx.Arg(0));
         if (process is null) return BoolResult(ctx, false, Win32Error.InvalidHandle);
-        if (ctx.Arg(1) == 0 || ctx.Arg32(2) < 72) return BoolResult(ctx, false, Win32Error.InvalidParameter);
+        if (ctx.Arg(1) == 0 || ctx.Arg32(2) < 72 || !ctx.Memory.IsWritable(ctx.Arg(1), ctx.Arg32(2) >= 80 ? 80UL : 72UL))
+            return BoolResult(ctx, false, Win32Error.InvalidParameter);
         var counters = process.Memory.Process;
         counters.Size = ctx.Arg32(2) >= 80 ? 80u : 72u;
         var bytes = new byte[80];
@@ -54,7 +55,7 @@ public static class MemoryInformationApis
         "kernelbase!GetPhysicallyInstalledSystemMemory")]
     private static ulong GetPhysicallyInstalledSystemMemory(ApiCallContext ctx)
     {
-        if (ctx.Arg(0) == 0) return BoolResult(ctx, false, Win32Error.InvalidParameter);
+        if (ctx.Arg(0) == 0 || !ctx.Memory.IsWritable(ctx.Arg(0), 8)) return BoolResult(ctx, false, Win32Error.InvalidParameter);
         ctx.Write(ctx.Arg(0), ctx.Runtime.Memory.GetSnapshot().Available.TotalPhysical / 1024);
         return 1;
     }
@@ -122,7 +123,8 @@ public static class MemoryInformationApis
         "kernel32!K32GetPerformanceInfo", "kernelbase!K32GetPerformanceInfo")]
     private static ulong GetPerformanceInfo(ApiCallContext ctx)
     {
-        if (ctx.Arg(0) == 0 || ctx.Arg32(1) < 104) return BoolResult(ctx, false, Win32Error.InvalidParameter);
+        if (ctx.Arg(0) == 0 || ctx.Arg32(1) < 104 || !ctx.Memory.IsWritable(ctx.Arg(0), 104))
+            return BoolResult(ctx, false, Win32Error.InvalidParameter);
         var snapshot = ctx.Runtime.Memory.GetSnapshot();
         var processes = ctx.Runtime.GetProcessInformation();
         var system = processes[0].Memory.Process;

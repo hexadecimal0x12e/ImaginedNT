@@ -2,6 +2,7 @@ using static ImaginedNT.Apis.ApiHelpers;
 using ImaginedNT.Core.Io;
 using ImaginedNT.Core.Nt;
 using ImaginedNT.Core.Objects;
+using ImaginedNT.Core.Security;
 
 namespace ImaginedNT.Core.Runtime;
 
@@ -11,11 +12,27 @@ public static class SynchronizationApis
 
     private static ulong EventWait(ApiCallContext ctx, EventObject ev, uint timeout)
     {
-        ev.Wait(timeout);
+        WaitInterruptibly(ctx, timeout, ev.Wait);
         return NtStatus.Success;
     }
 
-    private static uint WaitForObject(ApiCallContext ctx, ulong handle, uint timeout)
+    private static uint WaitInterruptibly(ApiCallContext ctx, uint timeout, Func<uint, uint> wait)
+    {
+        var started = Environment.TickCount64;
+        while (true)
+        {
+            if (ctx.Thread.TerminationRequested) throw new GuestThreadExitException(ctx.Thread.TerminationExitCode);
+            var remaining = timeout == uint.MaxValue ? 50u : (uint)Math.Max(0, (long)timeout - (Environment.TickCount64 - started));
+            var status = wait(Math.Min(remaining, 50u));
+            if (status != NtStatus.WaitTimeout) return status;
+            if (timeout != uint.MaxValue && Environment.TickCount64 - started >= timeout) return status;
+        }
+    }
+
+    private static uint WaitForObject(ApiCallContext ctx, ulong handle, uint timeout) =>
+        WaitInterruptibly(ctx, timeout, ms => WaitForObjectCore(ctx, handle, ms));
+
+    private static uint WaitForObjectCore(ApiCallContext ctx, ulong handle, uint timeout)
     {
         if (handle == CurrentProcessPseudoHandle)
         {
@@ -29,9 +46,10 @@ public static class SynchronizationApis
         }
         if (handle == CurrentThreadPseudoHandle)
         {
-            return NtStatus.WaitTimeout;
+            return WaitForFile(ctx, timeout);
         }
-        if (!ctx.Handles.TryGet(handle, out var obj) || obj is null) return NtStatus.InvalidHandle;
+        var status = ctx.Handles.TryGet(handle, NtAccess.Synchronize, out var obj);
+        if (status != NtStatus.Success) return status;
         return obj switch
         {
             EventObject ev => ev.Wait(timeout),
@@ -75,8 +93,21 @@ public static class SynchronizationApis
     private static MutantObject? FindMutant(ApiCallContext ctx, string path) => ctx.ObjectManager.Open<MutantObject>(path);
     private static SemaphoreObject? FindSemaphore(ApiCallContext ctx, string path) => ctx.ObjectManager.Open<SemaphoreObject>(path);
 
-    private static ulong OpenObjectHandle(ApiCallContext ctx, NtObject obj, uint access = 0x001F_0001) =>
-        ctx.Handles.Create(obj, access);
+    private static ulong OpenObjectHandle(ApiCallContext ctx, NtObject obj)
+    {
+        var access = ctx.Name.StartsWith("Nt", StringComparison.Ordinal) ? ctx.Arg32(1) :
+            ctx.Name.StartsWith("Open", StringComparison.Ordinal) ? ctx.Arg32(0) : 0x001F0003u;
+        if ((access & NtAccess.GenericAll) != 0) access = 0x001F0003;
+        if ((access & NtAccess.GenericRead) != 0) access = (access & ~NtAccess.GenericRead) | 0x00120001;
+        if ((access & NtAccess.GenericWrite) != 0) access = (access & ~NtAccess.GenericWrite) | 0x00020002;
+        var handle = ctx.Handles.Create(obj, access);
+        if (handle == 0) ctx.SetLastError(Win32Error.AccessDenied);
+        return handle;
+    }
+
+    private static ResourceSecurity DefaultSecurity(ApiCallContext ctx) => new([
+        new(ctx.Thread.EffectiveToken.User.Sid, uint.MaxValue), new("S-1-5-18", uint.MaxValue)
+    ]);
 
     private static ulong CreateNamedOrOpen<T>(ApiCallContext ctx, string? name, Func<T> factory, out T? result, out uint status)
         where T : NtObject
@@ -86,7 +117,8 @@ public static class SynchronizationApis
         if (string.IsNullOrEmpty(name))
         {
             result = factory();
-            var unnamedHandle = ctx.Handles.Create(result);
+            result.Security = DefaultSecurity(ctx);
+            var unnamedHandle = OpenObjectHandle(ctx, result);
             result.Release();
             return unnamedHandle;
         }
@@ -104,14 +136,17 @@ public static class SynchronizationApis
                 }
                 result = typed;
                 if (ctx.Name.StartsWith("Create", StringComparison.Ordinal)) ctx.SetLastError(Win32Error.AlreadyExists);
-                return OpenObjectHandle(ctx, typed);
+                var opened = OpenObjectHandle(ctx, typed);
+                if (opened == 0) status = NtStatus.AccessDenied;
+                return opened;
             }
 
             var created = factory();
+            created.Security = DefaultSecurity(ctx);
             created.Name = name;
             ctx.ObjectManager.CreateObject(path, created);
             result = created;
-            var handle = ctx.Handles.Create(created);
+            var handle = OpenObjectHandle(ctx, created);
             created.Release();
             if (ctx.Name.StartsWith("Create", StringComparison.Ordinal)) ctx.SetLastError(Win32Error.Success);
             return handle;
@@ -141,8 +176,16 @@ public static class SynchronizationApis
             status = NtStatus.ObjectTypeMismatch;
             return 0;
         }
-        var handle = ctx.Handles.Create(typed);
+        var handle = OpenObjectHandle(ctx, typed);
+        if (handle == 0) status = NtStatus.AccessDenied;
         return handle;
+    }
+
+    private static uint GetSynchronizationObject<T>(ApiCallContext ctx, uint access, out T obj) where T : NtObject
+    {
+        var status = ctx.Handles.TryGet(ctx.Arg(0), access, out var value);
+        obj = (value as T)!;
+        return status != NtStatus.Success ? status : obj is null ? NtStatus.InvalidHandle : NtStatus.Success;
     }
 
     // --- handles / close -------------------------------------------------------------
@@ -243,7 +286,8 @@ public static class SynchronizationApis
     [VirtualApi("kernel32.dll", "SetEvent", ApiCategory.Synchronization)]
     private static ulong SetEvent(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not EventObject ev) return BoolResult(ctx, false, Win32Error.InvalidHandle);
+        var accessStatus = GetSynchronizationObject<EventObject>(ctx, NtAccess.EventModifyState, out var ev);
+        if (accessStatus != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(accessStatus));
         ev.Set();
         return 1;
     }
@@ -251,7 +295,8 @@ public static class SynchronizationApis
     [VirtualApi("kernel32.dll", "ResetEvent", ApiCategory.Synchronization)]
     private static ulong ResetEvent(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not EventObject ev) return BoolResult(ctx, false, Win32Error.InvalidHandle);
+        var accessStatus = GetSynchronizationObject<EventObject>(ctx, NtAccess.EventModifyState, out var ev);
+        if (accessStatus != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(accessStatus));
         ev.Reset();
         return 1;
     }
@@ -259,7 +304,8 @@ public static class SynchronizationApis
     [VirtualApi("kernel32.dll", "PulseEvent", ApiCategory.Synchronization)]
     private static ulong PulseEvent(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not EventObject ev) return BoolResult(ctx, false, Win32Error.InvalidHandle);
+        var accessStatus = GetSynchronizationObject<EventObject>(ctx, NtAccess.EventModifyState, out var ev);
+        if (accessStatus != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(accessStatus));
         ev.Pulse();
         return 1;
     }
@@ -289,7 +335,8 @@ public static class SynchronizationApis
     [VirtualApi("ntdll.dll", "NtSetEvent", ApiCategory.Synchronization, "ntdll!ZwSetEvent")]
     private static ulong NtSetEvent(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not EventObject ev) return NtStatus.InvalidHandle;
+        var accessStatus = GetSynchronizationObject<EventObject>(ctx, NtAccess.EventModifyState, out var ev);
+        if (accessStatus != NtStatus.Success) return accessStatus;
         var previous = ev.Set();
         if (ctx.Arg(1) != 0) ctx.Memory.Write(ctx.Arg(1), previous ? 1 : 0);
         return NtStatus.Success;
@@ -298,7 +345,8 @@ public static class SynchronizationApis
     [VirtualApi("ntdll.dll", "NtResetEvent", ApiCategory.Synchronization, "ntdll!ZwResetEvent")]
     private static ulong NtResetEvent(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not EventObject ev) return NtStatus.InvalidHandle;
+        var accessStatus = GetSynchronizationObject<EventObject>(ctx, NtAccess.EventModifyState, out var ev);
+        if (accessStatus != NtStatus.Success) return accessStatus;
         var previous = ev.Reset();
         if (ctx.Arg(1) != 0) ctx.Memory.Write(ctx.Arg(1), previous ? 1 : 0);
         return NtStatus.Success;
@@ -307,7 +355,8 @@ public static class SynchronizationApis
     [VirtualApi("ntdll.dll", "NtPulseEvent", ApiCategory.Synchronization, "ntdll!ZwPulseEvent")]
     private static ulong NtPulseEvent(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not EventObject ev) return NtStatus.InvalidHandle;
+        var accessStatus = GetSynchronizationObject<EventObject>(ctx, NtAccess.EventModifyState, out var ev);
+        if (accessStatus != NtStatus.Success) return accessStatus;
         var previous = ev.Pulse();
         if (ctx.Arg(1) != 0) ctx.Memory.Write(ctx.Arg(1), previous ? 1 : 0);
         return NtStatus.Success;
@@ -367,8 +416,8 @@ public static class SynchronizationApis
     [VirtualApi("kernel32.dll", "ReleaseMutex", ApiCategory.Synchronization)]
     private static ulong ReleaseMutex(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not MutantObject mutant)
-            return BoolResult(ctx, false, Win32Error.InvalidHandle);
+        var accessStatus = GetSynchronizationObject<MutantObject>(ctx, NtAccess.MutantModifyState, out var mutant);
+        if (accessStatus != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(accessStatus));
         var status = mutant.Release(ctx.Thread.Id);
         return BoolResult(ctx, status == NtStatus.Success, Win32FromStatus(status));
     }
@@ -397,7 +446,8 @@ public static class SynchronizationApis
     [VirtualApi("ntdll.dll", "NtReleaseMutant", ApiCategory.Synchronization, "ntdll!ZwReleaseMutant")]
     private static ulong NtReleaseMutant(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not MutantObject mutant) return NtStatus.InvalidHandle;
+        var accessStatus = GetSynchronizationObject<MutantObject>(ctx, NtAccess.MutantModifyState, out var mutant);
+        if (accessStatus != NtStatus.Success) return accessStatus;
         // NT releases one acquisition.  The previous count is not exposed by the managed object.
         var status = mutant.Release(ctx.Thread.Id);
         if (ctx.Arg(1) != 0) ctx.Memory.Write(ctx.Arg(1), mutant.RecursionCount);
@@ -446,8 +496,8 @@ public static class SynchronizationApis
     [VirtualApi("kernel32.dll", "ReleaseSemaphore", ApiCategory.Synchronization)]
     private static ulong ReleaseSemaphore(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not SemaphoreObject semaphore)
-            return BoolResult(ctx, false, Win32Error.InvalidHandle);
+        var accessStatus = GetSynchronizationObject<SemaphoreObject>(ctx, NtAccess.SemaphoreModifyState, out var semaphore);
+        if (accessStatus != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(accessStatus));
         var status = semaphore.Release((int)Math.Max(1, ctx.Arg32(1)), out var previous);
         if (status == NtStatus.Success && ctx.Arg(2) != 0) ctx.Memory.Write(ctx.Arg(2), previous);
         return BoolResult(ctx, status == NtStatus.Success, Win32FromStatus(status));
@@ -478,7 +528,8 @@ public static class SynchronizationApis
     [VirtualApi("ntdll.dll", "NtReleaseSemaphore", ApiCategory.Synchronization, "ntdll!ZwReleaseSemaphore")]
     private static ulong NtReleaseSemaphore(ApiCallContext ctx)
     {
-        if (GetObject(ctx, ctx.Arg(0)) is not SemaphoreObject semaphore) return NtStatus.InvalidHandle;
+        var accessStatus = GetSynchronizationObject<SemaphoreObject>(ctx, NtAccess.SemaphoreModifyState, out var semaphore);
+        if (accessStatus != NtStatus.Success) return accessStatus;
         var status = semaphore.Release((int)Math.Max(1, ctx.Arg32(1)), out var previous);
         if (status == NtStatus.Success && ctx.Arg(2) != 0) ctx.Memory.Write(ctx.Arg(2), previous);
         return status;

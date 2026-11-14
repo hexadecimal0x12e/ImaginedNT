@@ -35,14 +35,16 @@ public static partial class FileApis
 
     private static uint Win32ShareToNt(uint share) => share & 0x7;
 
-    private static ulong OpenManagedFile(ApiCallContext ctx, string path, uint desiredAccess, uint share,
-        CreateDisposition disposition, CreateOptions options)
+    private static uint OpenManagedFile(ApiCallContext ctx, string path, uint desiredAccess, uint share,
+        CreateDisposition disposition, CreateOptions options, out ulong handle)
     {
-        var file = ctx.Process.FileSystem.CreateOrOpen(path, desiredAccess, (ShareAccess)Win32ShareToNt(share),
-            disposition, options, ctx.Process.CurrentDirectory);
-        var handle = ctx.Handles.Create(file, desiredAccess == 0 ? 0x0012_019F : desiredAccess);
-        file.Release();
-        return handle;
+        handle = 0;
+        var status = ctx.Process.FileSystem.TryCreateOrOpen(path, desiredAccess, (ShareAccess)Win32ShareToNt(share),
+            disposition, options, ctx.Process.CurrentDirectory, out var file);
+        if (status != NtStatus.Success) return status;
+        handle = ctx.Handles.Create(file!, desiredAccess);
+        file!.Release();
+        return NtStatus.Success;
     }
 
     // --- standard handles -----------------------------------------------------------
@@ -148,8 +150,9 @@ public static partial class FileApis
             var flags = ctx.Arg32(5);
             var options = CreateOptions.None;
             if ((flags & FILE_FLAG_BACKUP_SEMANTICS) != 0) options |= CreateOptions.DirectoryFile;
-            var handle = OpenManagedFile(ctx, path, access, share, disposition, options);
-            return handle;
+            if ((flags & 0x04000000) != 0) options |= CreateOptions.DeleteOnClose;
+            var status = OpenManagedFile(ctx, path, access, share, disposition, options, out var handle);
+            return status == NtStatus.Success ? handle : FailInvalidHandle(ctx, Win32FromStatus(status));
         }
         catch (NtFileException ex)
         {
@@ -167,7 +170,9 @@ public static partial class FileApis
         {
             var flags = ctx.Arg32(5);
             var options = (flags & FILE_FLAG_BACKUP_SEMANTICS) != 0 ? CreateOptions.DirectoryFile : CreateOptions.None;
-            return OpenManagedFile(ctx, path, ctx.Arg32(1), ctx.Arg32(2), Win32DispositionToNt(ctx.Arg32(4)), options);
+            if ((flags & 0x04000000) != 0) options |= CreateOptions.DeleteOnClose;
+            var status = OpenManagedFile(ctx, path, ctx.Arg32(1), ctx.Arg32(2), Win32DispositionToNt(ctx.Arg32(4)), options, out var handle);
+            return status == NtStatus.Success ? handle : FailInvalidHandle(ctx, Win32FromStatus(status));
         }
         catch (NtFileException ex)
         {
@@ -182,7 +187,8 @@ public static partial class FileApis
         if (ctx.Arg(3) != 0) ctx.Write(ctx.Arg(3), 0u);
         if (!ctx.TryGetFile(ctx.Arg(0), out var file) || file is null || file.IsDirectory)
             return BoolResult(ctx, false, Win32Error.InvalidHandle);
-        if (!file.CanRead) return BoolResult(ctx, false, Win32Error.AccessDenied);
+        if (!file.CanRead || ctx.Handles.TryGet(ctx.Arg(0), NtAccess.FileReadData, out _) != NtStatus.Success)
+            return BoolResult(ctx, false, Win32Error.AccessDenied);
         var length = (int)Math.Min(ctx.Arg32(2), 1 << 30);
         var buffer = new byte[length];
         int read;
@@ -213,7 +219,7 @@ public static partial class FileApis
         if (ctx.Arg(3) != 0) ctx.Write(ctx.Arg(3), 0u);
         if (!ctx.TryGetFile(ctx.Arg(0), out var file) || file is null || file.IsDirectory)
             return BoolResult(ctx, false, Win32Error.InvalidHandle);
-        if (!file.CanWrite) return BoolResult(ctx, false, Win32Error.AccessDenied);
+        if (!file.CanWrite || !CanWriteFile(ctx, ctx.Arg(0))) return BoolResult(ctx, false, Win32Error.AccessDenied);
         var length = (int)Math.Min(ctx.Arg32(2), 1 << 30);
         var bytes = ctx.Memory.ReadBytes(ctx.Arg(1), length);
         try
@@ -299,8 +305,10 @@ public static partial class FileApis
             return BoolResult(ctx, false, Win32Error.InvalidParameter);
         try
         {
-            var hostFrom = ctx.Process.FileSystem.MapPath(from, ctx.Process.CurrentDirectory);
-            var hostTo = ctx.Process.FileSystem.MapPath(to, ctx.Process.CurrentDirectory, FileOperation.Write);
+            var status = ctx.Process.FileSystem.TryMapPath(from, ctx.Process.CurrentDirectory, FileOperation.Read, out var hostFrom);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
+            status = ctx.Process.FileSystem.TryMapPath(to, ctx.Process.CurrentDirectory, FileOperation.Write, out var hostTo);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
             // CopyFileW's third argument / CopyFileExW's dwCopyFlags: fail if the target exists.
             var failIfExists = (ctx.Name == "CopyFileExW" ? ctx.Arg32(5) : ctx.Arg32(2)) & 1;
             if (!HostFileSystem.FileExists(hostFrom))
@@ -331,7 +339,12 @@ public static partial class FileApis
                 ctx.Runtime.Trace.Emit(ImaginedNT.Core.Diagnostics.TraceKind.File,
                     $"GetFileAttributesW(0x{ctx.Arg(0):X} '{path}') cwd='{ctx.Process.CurrentDirectory}' caller=0x{ctx.ReturnAddress:X16}",
                     ctx.Process.Id, ctx.Thread.Id);
-            var host = ctx.Process.FileSystem.MapMetadataPath(path, ctx.Process.CurrentDirectory);
+            var status = ctx.Process.FileSystem.TryMapMetadataPath(path, ctx.Process.CurrentDirectory, out var host);
+            if (status != NtStatus.Success)
+            {
+                ctx.SetLastError(Win32FromStatus(status));
+                return 0xFFFF_FFFFUL;
+            }
             if (HostFileSystem.DirectoryExists(host)) return FILE_ATTRIBUTE_DIRECTORY;
             if (HostFileSystem.FileExists(host)) return 0x80;
             ctx.SetLastError(Win32Error.FileNotFound);
@@ -352,7 +365,8 @@ public static partial class FileApis
             return BoolResult(ctx, false, Win32Error.InvalidParameter);
         try
         {
-            var host = ctx.Process.FileSystem.MapMetadataPath(path, ctx.Process.CurrentDirectory);
+            var status = ctx.Process.FileSystem.TryMapMetadataPath(path, ctx.Process.CurrentDirectory, out var host);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
             var attributes = HostFileSystem.GetAttributes(host);
             var directory = (attributes & FileAttributes.Directory) != 0;
             var info = HostFileSystem.GetInfo(host);
@@ -410,7 +424,8 @@ public static partial class FileApis
         FileSearchEntry[] entries;
         try
         {
-            entries = BuildSearchEntries(ctx, pattern, caseSensitive);
+            entries = BuildSearchEntries(ctx, pattern, out var status, caseSensitive);
+            if (status != NtStatus.Success) return FailInvalidHandle(ctx, Win32FromStatus(status));
             if (directoriesOnly) entries = entries.Where(entry => entry.IsDirectory).ToArray();
         }
         catch (NtFileException ex)
@@ -466,14 +481,16 @@ public static partial class FileApis
         return 1;
     }
 
-    private static FileSearchEntry[] BuildSearchEntries(ApiCallContext ctx, string pattern, bool caseSensitive = false)
+    private static FileSearchEntry[] BuildSearchEntries(ApiCallContext ctx, string pattern, out uint status, bool caseSensitive = false)
     {
+        status = NtStatus.Success;
         var normalized = pattern.Replace('/', '\\');
         var currentDirectory = ctx.Process.CurrentDirectory;
 
         if (normalized.IndexOfAny(['*', '?']) < 0 && !caseSensitive)
         {
-            var host = ctx.Process.FileSystem.MapPath(normalized, currentDirectory, FileOperation.Enum);
+            status = ctx.Process.FileSystem.TryMapPath(normalized, currentDirectory, FileOperation.Enum, out var host);
+            if (status != NtStatus.Success) return [];
             // FindFirstFileW takes a file-name pattern, not a bare directory path.  Windows
             // returns ERROR_FILE_NOT_FOUND for "C:\", "C:" and for "."/".." components; treating
             // them as "enumerate everything" makes cmd.exe interpret the first entry as the
@@ -511,7 +528,8 @@ public static partial class FileApis
             else if (directoryPart.EndsWith(':')) directoryPart += "\\";
         }
 
-        var directoryHost = ctx.Process.FileSystem.MapPath(directoryPart, currentDirectory, FileOperation.Enum);
+        status = ctx.Process.FileSystem.TryMapPath(directoryPart, currentDirectory, FileOperation.Enum, out var directoryHost);
+        if (status != NtStatus.Success) return [];
         if (!HostFileSystem.DirectoryExists(directoryHost)) throw new NtFileException(NtStatus.ObjectNameNotFound, pattern);
         return ctx.Process.FileSystem.Enumerate(directoryPart, currentDirectory).Where(i => MatchesFindPattern(namePattern, i.Name, caseSensitive)).Select(i => CreateEntry(i, i.Name)).ToArray();
     }
@@ -662,8 +680,8 @@ public static partial class FileApis
         if (path is null) return BoolResult(ctx, false, Win32Error.InvalidParameter);
         try
         {
-            ctx.Process.FileSystem.Delete(path, ctx.Process.CurrentDirectory);
-            return 1;
+            var status = ctx.Process.FileSystem.TryDelete(path, ctx.Process.CurrentDirectory);
+            return BoolResult(ctx, status == NtStatus.Success, Win32FromStatus(status));
         }
         catch (NtFileException ex) { return BoolResult(ctx, false, Win32FromStatus(ex.Status)); }
         catch (IOException) { return BoolResult(ctx, false, Win32Error.SharingViolation); }
@@ -676,9 +694,10 @@ public static partial class FileApis
         if (path is null) return BoolResult(ctx, false, Win32Error.InvalidParameter);
         try
         {
-            var host = ctx.Process.FileSystem.MapPath(path, ctx.Process.CurrentDirectory, FileOperation.Write);
-            if (HostFileSystem.DirectoryExists(host)) return BoolResult(ctx, false, Win32Error.AlreadyExists);
-            if (!ctx.Process.FileSystem.ResolveAccess(path, ctx.Process.CurrentDirectory, FileOperation.Write).Discard) HostFileSystem.CreateDirectory(host);
+            var status = ctx.Process.FileSystem.TryResolveAccess(path, ctx.Process.CurrentDirectory, FileOperation.Write, out var access);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
+            if (HostFileSystem.DirectoryExists(access.Path)) return BoolResult(ctx, false, Win32Error.AlreadyExists);
+            if (!access.Discard) HostFileSystem.CreateDirectory(access.Path);
             return 1;
         }
         catch (NtFileException ex) { return BoolResult(ctx, false, Win32FromStatus(ex.Status)); }
@@ -692,10 +711,11 @@ public static partial class FileApis
         if (path is null) return BoolResult(ctx, false, Win32Error.InvalidParameter);
         try
         {
-            var host = ctx.Process.FileSystem.MapPath(path, ctx.Process.CurrentDirectory, FileOperation.Delete);
+            var status = ctx.Process.FileSystem.TryMapPath(path, ctx.Process.CurrentDirectory, FileOperation.Delete, out var host);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
             if (!HostFileSystem.DirectoryExists(host)) return BoolResult(ctx, false, Win32Error.PathNotFound);
-            ctx.Process.FileSystem.Delete(path, ctx.Process.CurrentDirectory);
-            return 1;
+            status = ctx.Process.FileSystem.TryDelete(path, ctx.Process.CurrentDirectory);
+            return BoolResult(ctx, status == NtStatus.Success, Win32FromStatus(status));
         }
         catch (NtFileException ex) { return BoolResult(ctx, false, Win32FromStatus(ex.Status)); }
         catch (IOException) { return BoolResult(ctx, false, Win32Error.DirectoryNotEmpty); }
@@ -710,13 +730,18 @@ public static partial class FileApis
         if (from is null || to is null) return BoolResult(ctx, false, Win32Error.InvalidParameter);
         try
         {
-            var hostFrom = ctx.Process.FileSystem.MapPath(from, ctx.Process.CurrentDirectory);
-            var hostTo = ctx.Process.FileSystem.MapPath(to, ctx.Process.CurrentDirectory, FileOperation.Write);
+            var status = ctx.Process.FileSystem.TryMapPath(from, ctx.Process.CurrentDirectory, FileOperation.Read, out _);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
+            status = ctx.Process.FileSystem.TryMapPath(to, ctx.Process.CurrentDirectory, FileOperation.Write, out var hostTo);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
             var replace = (ctx.Arg32(2) & 0x1) != 0; // MOVEFILE_REPLACE_EXISTING
             if (HostFileSystem.FileExists(hostTo) && !replace) return BoolResult(ctx, false, Win32Error.AlreadyExists);
-            _ = ctx.Process.FileSystem.MapPath(from, ctx.Process.CurrentDirectory, FileOperation.Delete);
-            hostFrom = ctx.Process.FileSystem.MapNativePath(from, ctx.Process.CurrentDirectory, false, true);
-            hostTo = ctx.Process.FileSystem.MapNativePath(to, ctx.Process.CurrentDirectory, false, true);
+            status = ctx.Process.FileSystem.TryMapPath(from, ctx.Process.CurrentDirectory, FileOperation.Delete, out _);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
+            status = ctx.Process.FileSystem.TryMapNativePath(from, ctx.Process.CurrentDirectory, false, true, out var hostFrom);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
+            status = ctx.Process.FileSystem.TryMapNativePath(to, ctx.Process.CurrentDirectory, false, true, out hostTo);
+            if (status != NtStatus.Success) return BoolResult(ctx, false, Win32FromStatus(status));
             HostFileSystem.Move(hostFrom, hostTo, replace);
             return 1;
         }
@@ -767,7 +792,12 @@ public static partial class FileApis
         }
         try
         {
-            var handle = OpenManagedFile(ctx, path, desiredAccess, share, disposition, options);
+            var status = OpenManagedFile(ctx, path, desiredAccess, share, disposition, options, out var handle);
+            if (status != NtStatus.Success)
+            {
+                WriteNtStatus(ctx, ioStatus, status);
+                return status;
+            }
             if (handlePtr != 0) ctx.Memory.Write(handlePtr, handle);
             WriteNtStatus(ctx, ioStatus, NtStatus.Success);
             return NtStatus.Success;
@@ -796,7 +826,12 @@ public static partial class FileApis
         }
         try
         {
-            var handle = OpenManagedFile(ctx, path, desiredAccess, share, CreateDisposition.Open, options);
+            var status = OpenManagedFile(ctx, path, desiredAccess, share, CreateDisposition.Open, options, out var handle);
+            if (status != NtStatus.Success)
+            {
+                WriteNtStatus(ctx, ioStatus, status);
+                return status;
+            }
             if (handlePtr != 0) ctx.Memory.Write(handlePtr, handle);
             WriteNtStatus(ctx, ioStatus, NtStatus.Success);
             return NtStatus.Success;
@@ -831,7 +866,8 @@ public static partial class FileApis
         if (string.IsNullOrEmpty(path)) return NtStatus.ObjectNameInvalid;
         try
         {
-            var host = ctx.Process.FileSystem.MapMetadataPath(path, ctx.Process.CurrentDirectory);
+            var status = ctx.Process.FileSystem.TryMapMetadataPath(path, ctx.Process.CurrentDirectory, out var host);
+            if (status != NtStatus.Success) return status;
             var info = HostFileSystem.FileExists(host) ? HostFileSystem.GetInfo(host) : HostFileSystem.DirectoryExists(host) ? null : throw new NtFileException(NtStatus.ObjectNameNotFound, path);
             var buffer = ctx.Arg(1);
             if (buffer != 0) WriteBasicInformation(ctx, buffer, host, info);
@@ -848,7 +884,8 @@ public static partial class FileApis
         if (string.IsNullOrEmpty(path)) return NtStatus.ObjectNameInvalid;
         try
         {
-            var host = ctx.Process.FileSystem.MapMetadataPath(path, ctx.Process.CurrentDirectory);
+            var status = ctx.Process.FileSystem.TryMapMetadataPath(path, ctx.Process.CurrentDirectory, out var host);
+            if (status != NtStatus.Success) return status;
             if (!HostFileSystem.FileExists(host) && !HostFileSystem.DirectoryExists(host)) return NtStatus.ObjectNameNotFound;
             var buffer = ctx.Arg(1);
             if (buffer != 0) WriteNetworkOpenInformation(ctx, buffer, host);
@@ -863,7 +900,7 @@ public static partial class FileApis
         var attributes = ctx.ReadObjectAttributes(ctx.Arg(0));
         var path = attributes.FullPath ?? attributes.Name;
         if (string.IsNullOrEmpty(path)) return NtStatus.ObjectNameInvalid;
-        try { ctx.Process.FileSystem.Delete(path, ctx.Process.CurrentDirectory); return NtStatus.Success; }
+        try { return ctx.Process.FileSystem.TryDelete(path, ctx.Process.CurrentDirectory); }
         catch (NtFileException ex) { return ex.Status; }
         catch (IOException) { return NtStatus.SharingViolation; }
     }
@@ -876,6 +913,8 @@ public static partial class FileApis
 
     private static bool TrySeek(FileObject file, long distance, uint method, out long position)
     {
+        position = 0;
+        if (!file.CanSeek) return false;
         try
         {
             var origin = method switch
@@ -885,16 +924,19 @@ public static partial class FileApis
                 2 => SeekOrigin.End,
                 _ => (SeekOrigin)(-1)
             };
-            if ((int)origin < 0) { position = 0; return false; }
+            if ((int)origin < 0) return false;
             position = file.Seek(distance, origin);
             return true;
         }
         catch (NotSupportedException)
         {
-            position = 0;
             return false;
         }
     }
+
+    private static bool CanWriteFile(ApiCallContext ctx, ulong handle) =>
+        ctx.Handles.TryGet(handle, NtAccess.FileWriteData, out _) == NtStatus.Success ||
+        ctx.Handles.TryGet(handle, NtAccess.FileAppendData, out _) == NtStatus.Success;
 
     private static ulong NtReadWrite(ApiCallContext ctx, bool write)
     {
@@ -908,8 +950,9 @@ public static partial class FileApis
             WriteNtStatus(ctx, ioStatus, NtStatus.InvalidHandle);
             return NtStatus.InvalidHandle;
         }
-        if (write && !file.CanWrite) return FailIoStatus(ctx, ioStatus, NtStatus.AccessDenied);
-        if (!write && !file.CanRead) return FailIoStatus(ctx, ioStatus, NtStatus.AccessDenied);
+        if (write && (!file.CanWrite || !CanWriteFile(ctx, handle))) return FailIoStatus(ctx, ioStatus, NtStatus.AccessDenied);
+        if (!write && (!file.CanRead || ctx.Handles.TryGet(handle, NtAccess.FileReadData, out _) != NtStatus.Success))
+            return FailIoStatus(ctx, ioStatus, NtStatus.AccessDenied);
 
         long? originalPosition = null;
         try
@@ -1043,6 +1086,7 @@ public static partial class FileApis
             case FileInformationClass.FilePositionInformation:
             {
                 if (length < 8) return FailIoStatus(ctx, ioStatus, NtStatus.BufferTooSmall);
+                if (!file.CanSeek) return FailIoStatus(ctx, ioStatus, NtStatus.InvalidDeviceRequest);
                 ctx.Memory.Write(buffer, file.Position);
                 WriteNtStatus(ctx, ioStatus, NtStatus.Success, 8);
                 return NtStatus.Success;
@@ -1093,13 +1137,20 @@ public static partial class FileApis
         {
             case FileInformationClass.FilePositionInformation:
                 if (length < 8) return FailIoStatus(ctx, ioStatus, NtStatus.BufferTooSmall);
+                if (!file.CanSeek) return FailIoStatus(ctx, ioStatus, NtStatus.InvalidDeviceRequest);
                 file.Position = ctx.Memory.Read<long>(buffer);
                 WriteNtStatus(ctx, ioStatus, NtStatus.Success);
                 return NtStatus.Success;
             case FileInformationClass.FileDispositionInformation:
                 if (length < 1) return FailIoStatus(ctx, ioStatus, NtStatus.BufferTooSmall);
                 var delete = ctx.Memory.Read<byte>(buffer) != 0;
-                if (delete && file.Path is { } deletePath) _ = ctx.Process.FileSystem.MapPath(deletePath, ctx.Process.CurrentDirectory, FileOperation.Delete);
+                if (delete && ctx.Handles.TryGet(handle, NtAccess.Delete, out _) != NtStatus.Success)
+                    return FailIoStatus(ctx, ioStatus, NtStatus.AccessDenied);
+                if (delete && file.Path is { } deletePath)
+                {
+                    var status = ctx.Process.FileSystem.TryMapPath(deletePath, ctx.Process.CurrentDirectory, FileOperation.Delete, out _);
+                    if (status != NtStatus.Success) return FailIoStatus(ctx, ioStatus, status);
+                }
                 file.DeleteOnClose = delete;
                 WriteNtStatus(ctx, ioStatus, NtStatus.Success);
                 return NtStatus.Success;
@@ -1107,6 +1158,7 @@ public static partial class FileApis
             {
                 if (length < 8) return FailIoStatus(ctx, ioStatus, NtStatus.BufferTooSmall);
                 if (file is not DiskFileObject && file is not MappedFileObject) return FailIoStatus(ctx, ioStatus, NtStatus.InvalidDeviceRequest);
+                if (!CanWriteFile(ctx, handle)) return FailIoStatus(ctx, ioStatus, NtStatus.AccessDenied);
                 var newSize = ctx.Memory.Read<long>(buffer);
                 if (newSize < 0) return FailIoStatus(ctx, ioStatus, NtStatus.InvalidParameter);
                 if (file is MappedFileObject mapped) { mapped.SetLength(newSize); WriteNtStatus(ctx, ioStatus, NtStatus.Success); return NtStatus.Success; }

@@ -1,4 +1,4 @@
-namespace ImaginedNT.App.Gui;
+namespace ImaginedNT.AppShared.Gui;
 
 public interface IWindowDrawing
 {
@@ -144,13 +144,11 @@ internal static class WindowGeometry
     public static GuiRect Outer(GuestWindow window) =>
         new(window.X, window.Y, Math.Max(0, window.Width), Math.Max(0, window.Height));
 
-    public static GuiRect Client(GuestWindow window, GuiRect outer)
+    public static GuiRect Client(GuestWindow window, GuiRect outer, bool respectWindowBorderStyle)
     {
         if (window.IsChild) return outer;
         var border = BorderWidth;
-#if FULL_TRUST_APP
-        if ((window.Style & (Win32.WS_BORDER | Win32.WS_DLGFRAME | Win32.WS_THICKFRAME)) == 0) border = 0;
-#endif
+        if (respectWindowBorderStyle && (window.Style & (Win32.WS_BORDER | Win32.WS_DLGFRAME | Win32.WS_THICKFRAME)) == 0) border = 0;
         var top = window.HasCaption ? CaptionHeight + border : border;
         return new(outer.X + border, outer.Y + top,
             Math.Max(0, window.Width - border * 2),
